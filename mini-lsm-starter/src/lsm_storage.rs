@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Bound, Not};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -136,6 +136,7 @@ pub enum CompactionFilter {
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    // To protect the creation of the new memtable and allow other readers to operate concurrently
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
@@ -293,8 +294,20 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let state = self.state.read();
+
+        if let Some(value) = state.memtable.get(key) {
+            return Ok(value.is_empty().not().then_some(value));
+        }
+
+        for imm_memtable in &state.imm_memtables {
+            if let Some(value) = imm_memtable.get(key) {
+                return Ok(value.is_empty().not().then_some(value));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -303,13 +316,27 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // put things into the memtable, and drop the read lock on LSM state
+        {
+            let state = self.state.read();
+            state.memtable.put(key, value)?;
+        }
+
+        if { self.state.read().memtable.approximate_size() } > self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            if { self.state.read().memtable.approximate_size() } > self.options.target_sst_size {
+                // gonna require write lock on `state`
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, b"")
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -334,7 +361,27 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        // Protected by _state_lock_observer
+        // `create_with_wal` involves I/O operations, which might takes 1 millisecond.
+        // In this way, other threads can modify the `state` concurrently when we are creating a new memtable.
+        let next_id = self.next_sst_id();
+        let next_memtable = Arc::new(MemTable::create(next_id));
+
+        {
+            // Protected by write lockguard, only one thread can access `state`
+            let mut lock = self.state.write();
+            // This is a brand-new state, but every field still points to the original address
+            let mut state_cloned = lock.as_ref().clone();
+
+            // 1. Replace the current memtable with the new one
+            let old_memtable = std::mem::replace(&mut state_cloned.memtable, next_memtable);
+            // 2. Insert the current memtable into the head of the immu_memtables
+            state_cloned.imm_memtables.insert(0, old_memtable);
+            // 3. Update the self's state with the new one
+            *lock = Arc::new(state_cloned);
+        }
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
