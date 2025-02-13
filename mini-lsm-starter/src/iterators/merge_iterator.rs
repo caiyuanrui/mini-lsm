@@ -16,6 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
 use anyhow::Result;
@@ -59,28 +60,88 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut iters = iters
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, iter)| iter.is_valid().then_some(HeapWrapper(i, iter)))
+            .collect::<BinaryHeap<_>>();
+        // current iter must be valid
+        let current = iters.pop();
+        Self { iters, current }
     }
 }
 
-impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIterator
-    for MergeIterator<I>
+impl<I> StorageIterator for MergeIterator<I>
+where
+    I: 'static,
+    I: for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
 {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|c| KeySlice::from_slice(c.1.key().raw_ref()))
+            .unwrap_or(KeySlice::from_slice(&[]))
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().map(|c| c.1.value()).unwrap_or(&[])
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.as_ref().is_some_and(|c| c.1.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // current must be valid, if we have tranverse all elements, current will be assigned None
+        let current = match self.current.as_mut() {
+            Some(current) => current,
+            None => return Ok(()),
+        };
+        let current_key = current.1.key();
+
+        // advance all iters until no key is identical to the current key
+        while let Some(mut pm) = self.iters.peek_mut() {
+            if pm.1.key() != current_key {
+                break;
+            }
+
+            // advance peek iter, if it returns err, remove it from iters
+            if let e @ Err(_) = pm.1.next() {
+                PeekMut::pop(pm);
+                return e;
+            }
+            // if peek iter is not valid, we need to evict it from the binary heap
+            if !pm.1.is_valid() {
+                PeekMut::pop(pm);
+            }
+        }
+
+        // then we advance current iter
+        // note that, there is no identical keys in one iterator
+        current.1.next()?;
+
+        if !current.1.is_valid() {
+            self.current = self.iters.pop();
+        } else if let Some(mut pm) = self.iters.peek_mut() {
+            if current < &mut pm {
+                std::mem::swap(current, &mut pm);
+            }
+        }
+
+        Ok(())
     }
+
+    // fn num_active_iterators(&self) -> usize {
+    //     self.iters
+    //         .iter()
+    //         .map(|hw| hw.1.num_active_iterators())
+    //         .sum::<usize>()
+    //         + self
+    //             .current
+    //             .as_ref()
+    //             .map(|hw| hw.1.num_active_iterators())
+    //             .unwrap_or(0)
+    // }
 }
