@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::{Bound, Not};
+use std::ops::{Bound, Not, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ use crate::compact::{
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::{MemTable, MemTableIterator};
+use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -414,4 +414,11 @@ impl LsmStorageInner {
             .and_then(LsmIterator::new)
             .map(FusedIterator::new)
     }
+
+    pub fn scan_range(&self, range: impl RangeBounds<[u8]>) -> Result<FusedIterator<LsmIterator>> {
+        self.scan(range.start_bound(), range.end_bound())
+    }
 }
+
+#[test]
+fn test() {}

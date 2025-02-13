@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use nom::AsBytes;
 use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
-use crate::key::{Key, KeySlice};
+use crate::key::KeySlice;
 use crate::table::SsTableBuilder;
 use crate::wal::Wal;
 
@@ -145,6 +145,10 @@ impl MemTable {
         );
         _ = ret.next();
         ret
+    }
+
+    pub fn scan_range(&self, range: impl RangeBounds<[u8]>) -> MemTableIterator {
+        self.scan(range.start_bound(), range.end_bound())
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
