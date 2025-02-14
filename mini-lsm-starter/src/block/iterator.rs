@@ -24,6 +24,7 @@ use super::{
 };
 
 /// Iterates on a block.
+#[derive(Debug, Default)]
 pub struct BlockIterator {
     /// The internal `Block`, wrapped by an `Arc`
     block: Arc<Block>,
@@ -80,20 +81,36 @@ impl BlockIterator {
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        let first_key_start = KEY_LEN_SIZE;
-        let first_key_len = self.block.data[..first_key_start].as_ref().get_u16() as usize;
-        let first_key_end = first_key_start + first_key_len;
-        let first_key = KeyVec::from_vec(self.block.data[first_key_start..first_key_end].to_vec());
-        let first_value_start = first_key_end + VAL_LEN_SIZE;
-        let first_value_len = self.block.data[first_key_end..first_value_start]
-            .as_ref()
-            .get_u16() as usize;
-        let value_range = (first_value_start, first_value_start + first_value_len);
+        self.seek_to_index(0);
+        self.first_key = self.key().to_key_vec();
+    }
 
-        self.key = first_key.clone();
-        self.first_key = first_key;
-        self.value_range = value_range;
-        self.idx = 0;
+    /// Seeks to the last key in the block.
+    pub fn seek_to_last(&mut self) {
+        let num_of_elements = self.block.offsets.len();
+        self.seek_to_index(num_of_elements - 1);
+    }
+
+    /// Will mark the iterator as invalid if `index` is out of range `[0, num_of_elements)`.
+    pub fn seek_to_index(&mut self, index: usize) {
+        let num_of_elements = self.block.offsets.len();
+        if index >= num_of_elements {
+            self.key.clear();
+            return;
+        }
+
+        let offset = self.block.offsets[index] as usize;
+        let key_begin = offset + KEY_LEN_SIZE;
+        let key_len = self.block.data[offset..key_begin].as_ref().get_u16() as usize;
+        let key_end = key_begin + key_len;
+        let key = KeyVec::from_vec(self.block.data[key_begin..key_end].to_vec());
+        let value_begin = key_end + VAL_LEN_SIZE;
+        let value_len = self.block.data[key_end..value_begin].as_ref().get_u16() as usize;
+        let value_end = value_begin + value_len;
+
+        self.idx = index;
+        self.key = key;
+        self.value_range = (value_begin, value_end);
     }
 
     /// Move to the next key in the block.
@@ -101,42 +118,44 @@ impl BlockIterator {
         if !self.is_valid() {
             return;
         }
-
-        println!(
-            "num of elements: {}, idx: {}",
-            self.block.offsets.len(),
-            self.idx
-        );
-
-        if self.block.offsets.len() <= self.idx + 1 {
-            self.key.clear();
-            return;
-        }
-
-        let next_key_start = KEY_LEN_SIZE + self.value_range.1;
-        let next_key_len = self.block.data[self.value_range.1..next_key_start]
-            .as_ref()
-            .get_u16() as usize;
-        let next_key_end = next_key_start + next_key_len;
-        let next_key = KeyVec::from_vec(self.block.data[next_key_start..next_key_end].to_vec());
-        let next_value_start = next_key_end + VAL_LEN_SIZE;
-        let next_value_len = self.block.data[next_key_end..next_value_start]
-            .as_ref()
-            .get_u16() as usize;
-        let next_value_range = (next_value_start, next_value_start + next_value_len);
-
-        self.idx += 1;
-        self.key = next_key;
-        self.value_range = next_value_range;
+        self.seek_to_index(self.idx + 1);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        self.seek_to_first();
-        while self.is_valid() && self.key.as_key_slice() < key {
-            self.next();
+        let (mut lower, mut upper) = (0, self.block.offsets.len());
+        while lower < upper {
+            let mid = (lower + upper) / 2;
+            let offset = self.block.offsets[mid] as usize;
+            let key_len = self.block.data[offset..offset + KEY_LEN_SIZE]
+                .as_ref()
+                .get_u16() as usize;
+            let mid_key =
+                self.block.data[offset + KEY_LEN_SIZE..offset + KEY_LEN_SIZE + key_len].as_ref();
+            if mid_key < key.into_inner() {
+                lower = mid + 1;
+            } else {
+                upper = mid;
+            }
         }
+
+        if lower >= self.block.offsets.len() {
+            self.key.clear();
+            return;
+        }
+
+        let offset = self.block.offsets[lower] as usize;
+
+        let key_len = self.block.data[offset..offset + 2].as_ref().get_u16() as usize;
+        let key_end = offset + 2 + key_len;
+        let key = &self.block.data[offset + 2..key_end];
+        let value_len = self.block.data[key_end..key_end + 2].as_ref().get_u16() as usize;
+        let value_begin = key_end + 2;
+
+        self.idx = offset;
+        self.key = KeyVec::from_vec(key.to_vec());
+        self.value_range = (value_begin, value_begin + value_len);
     }
 }

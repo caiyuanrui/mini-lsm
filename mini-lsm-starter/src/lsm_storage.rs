@@ -419,6 +419,3 @@ impl LsmStorageInner {
         self.scan(range.start_bound(), range.end_bound())
     }
 }
-
-#[test]
-fn test() {}
