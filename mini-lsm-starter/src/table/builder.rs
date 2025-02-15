@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,6 +24,8 @@ use crate::{
     key::KeySlice,
     lsm_storage::BlockCache,
 };
+
+const SST_SIZE: usize = 512 * 1024 * 1024;
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
@@ -45,7 +44,7 @@ impl SsTableBuilder {
             builder: BlockBuilder::new(block_size),
             first_key: Vec::new(),
             last_key: Vec::new(),
-            data: Vec::new(),
+            data: Vec::with_capacity(SST_SIZE),
             meta: Vec::new(),
             block_size,
         }

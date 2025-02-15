@@ -27,36 +27,80 @@ pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     // Add fields as need
 }
 
-impl<
-        A: 'static + StorageIterator,
-        B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
-    > TwoMergeIterator<A, B>
+impl<A, B> TwoMergeIterator<A, B>
+where
+    A: 'static + StorageIterator,
+    B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        Ok(Self { a, b })
     }
 }
 
-impl<
-        A: 'static + StorageIterator,
-        B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
-    > StorageIterator for TwoMergeIterator<A, B>
+impl<A, B> StorageIterator for TwoMergeIterator<A, B>
+where
+    A: 'static + StorageIterator,
+    B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 {
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if !self.a.is_valid() {
+            return self.b.key();
+        }
+        if !self.b.is_valid() {
+            return self.a.key();
+        }
+        if self.a.key() <= self.b.key() {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if !self.a.is_valid() {
+            return self.b.value();
+        }
+        if !self.b.is_valid() {
+            return self.a.value();
+        }
+        if self.a.key() <= self.b.key() {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.a.is_valid() {
+            self.b.next()?;
+            return Ok(());
+        }
+        if !self.b.is_valid() {
+            self.a.next()?;
+            return Ok(());
+        }
+
+        debug_assert!(self.a.is_valid() && self.b.is_valid());
+
+        // Why I have to declare the scope explicitly
+        // If I don't do this, Rust's borrow checker will yell at me
+        let cmp = { self.a.key().cmp(&self.b.key()) };
+
+        match cmp {
+            std::cmp::Ordering::Less => self.a.next()?,
+            std::cmp::Ordering::Greater => self.b.next()?,
+            std::cmp::Ordering::Equal => {
+                self.a.next()?;
+                self.b.next()?;
+            }
+        }
+
+        Ok(())
     }
 }
