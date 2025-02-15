@@ -39,9 +39,7 @@ fn test_task1_merge_1() {
         (Bytes::from("c"), Bytes::from("3.2")),
         (Bytes::from("d"), Bytes::from("4.2")),
     ]);
-
     let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
-
     check_iter_result_by_key(
         &mut iter,
         vec![

@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::{Bound, Not, RangeBounds};
+use std::ops::{Bound, Not, Range, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -31,11 +31,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -401,21 +404,102 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read();
-        let mut iters = vec![Box::new(state.memtable.scan(lower, upper))];
-        iters.extend(
+        let state = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let mut mt_iters = Vec::with_capacity(state.imm_memtables.len() + 1);
+        mt_iters.push(Box::new(state.memtable.scan(lower, upper)));
+        mt_iters.extend(
             state
                 .imm_memtables
                 .iter()
                 .map(|mt| Box::new(mt.scan(lower, upper))),
         );
 
-        Ok(MergeIterator::create(iters))
-            .and_then(LsmIterator::new)
-            .map(FusedIterator::new)
+        let key_slice = match lower {
+            Bound::Included(bytes) => KeySlice::from_slice(bytes),
+            Bound::Excluded(bytes) => KeySlice::from_slice(bytes),
+            Bound::Unbounded => KeySlice::default(),
+        };
+
+        let mut sst_iters = Vec::with_capacity(state.l0_sstables.len());
+        for idx in &state.l0_sstables {
+            let sst_table = match state.sstables.get(idx) {
+                // sst_table is bounded and inclusive
+                Some(sst_table)
+                    if has_overlap(
+                        (
+                            sst_table.first_key().raw_ref(),
+                            sst_table.last_key().raw_ref(),
+                        ),
+                        (lower, upper),
+                    ) =>
+                {
+                    sst_table.clone()
+                }
+                _ => continue,
+            };
+            let sst_iter = {
+                let mut sst_iter = SsTableIterator::create_and_seek_to_key(sst_table, key_slice)?;
+                if let Bound::Excluded(key) = lower {
+                    if key == key_slice.raw_ref() {
+                        sst_iter.next()?;
+                    }
+                }
+                if !sst_iter.is_valid() {
+                    continue;
+                }
+                sst_iter
+            };
+            sst_iters.push(Box::new(sst_iter));
+        }
+
+        Ok(FusedIterator::new(LsmIterator::new(
+            TwoMergeIterator::create(
+                MergeIterator::create(mt_iters),
+                MergeIterator::create(sst_iters),
+            )?,
+            upper,
+        )?))
     }
 
     pub fn scan_range(&self, range: impl RangeBounds<[u8]>) -> Result<FusedIterator<LsmIterator>> {
         self.scan(range.start_bound(), range.end_bound())
+    }
+}
+
+// r1 is bounded and inclusive
+fn has_overlap<Idx: PartialOrd>(r1: (Idx, Idx), r2: (Bound<Idx>, Bound<Idx>)) -> bool {
+    let (m, n) = r1;
+    match r2 {
+        // r1 :   |---| [m, n]
+        // r2: ..--------.. (-inf, +inf)
+        (Bound::Unbounded, Bound::Unbounded) => true,
+        // r1:    |-----|
+        // r2: ..----| (-inf, y)
+        (Bound::Unbounded, Bound::Included(y)) => y >= m,
+        // r1:    |-----|
+        // r2: ..----o
+        (Bound::Unbounded, Bound::Excluded(y)) => y > m,
+        // r1:  |-----|
+        // r2:    |-------..
+        (Bound::Included(x), Bound::Unbounded) => x <= n,
+        // r1:  |-----|
+        // r2:    o-------..
+        (Bound::Excluded(x), Bound::Unbounded) => x < n,
+        // r1:   |----|
+        // r2: |----|
+        (Bound::Included(x), Bound::Included(y)) => !(y < m || x > n),
+        // r1: |----|
+        // r2: o---|
+        (Bound::Excluded(x), Bound::Included(y)) => !(y < m || x >= n),
+        // r1: |----|
+        // r2: |---o
+        (Bound::Included(x), Bound::Excluded(y)) => !(y <= m || x > n),
+        // r1: |----|
+        // r2: o---o
+        (Bound::Excluded(x), Bound::Excluded(y)) => !(y <= m || x >= n),
     }
 }
