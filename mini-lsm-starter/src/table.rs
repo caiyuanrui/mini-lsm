@@ -241,8 +241,14 @@ impl SsTable {
     }
 
     /// Read a block from disk, with block cache. (Day 4)
+    /// Blocks are cached by cache key (sst_id, block_id)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        match self.block_cache {
+            Some(ref cache) => cache
+                .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+                .map_err(|err| anyhow::anyhow!(err)),
+            None => self.read_block(block_idx),
+        }
     }
 
     /// Find the block that may contain `key`.

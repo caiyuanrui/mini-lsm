@@ -43,7 +43,7 @@ impl SsTableIterator {
 
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
-        self.blk_iter = BlockIterator::create_and_seek_to_first(self.table.read_block(0)?);
+        self.blk_iter = BlockIterator::create_and_seek_to_first(self.table.read_block_cached(0)?);
         self.blk_idx = 0;
         Ok(())
     }
@@ -67,38 +67,41 @@ impl SsTableIterator {
         // 1. first_key == key: happend to be what we want
         // 2. first_key > key: the right pivot might be in the previous block
         let blk_idx = self.table.find_block_idx(key);
-        println!("blk_idx: {blk_idx}");
 
         // if there is not such block whose first key-value pair is >= `key`
         // search this key in the last block
         if blk_idx == self.table.block_meta.len() {
-            let block = self.table.read_block(blk_idx - 1)?;
+            let block = self.table.read_block_cached(blk_idx - 1)?;
             self.blk_iter = BlockIterator::create_and_seek_to_key(block, key);
             self.blk_idx = blk_idx - 1;
             return Ok(());
         }
 
         let block_meta = &self.table.block_meta[blk_idx];
+
         if blk_idx == 0 || block_meta.first_key.as_key_slice() == key {
-            let block = self.table.read_block(blk_idx)?;
+            let block = self.table.read_block_cached(blk_idx)?;
             self.blk_iter = BlockIterator::create_and_seek_to_first(block);
             self.blk_idx = blk_idx;
-        } else if block_meta.first_key.as_key_slice() > key {
+            return Ok(());
+        }
+
+        if block_meta.first_key.as_key_slice() > key {
             // attempt to search this key in the previous block
-            let block = self.table.read_block(blk_idx - 1)?;
+            let block = self.table.read_block_cached(blk_idx - 1)?;
             let blk_iter = BlockIterator::create_and_seek_to_key(block, key);
             if blk_iter.is_valid() {
                 self.blk_iter = blk_iter;
                 self.blk_idx = blk_idx - 1;
                 return Ok(());
             }
-            // now we have first_key > key and prev_block.last_key < key
-            let block = self.table.read_block(blk_idx)?;
-            self.blk_iter = BlockIterator::create_and_seek_to_first(block);
-            self.blk_idx = blk_idx;
-        } else {
-            unreachable!()
         }
+
+        // now we have first_key > key and prev_block.last_key < key
+        let block = self.table.read_block_cached(blk_idx)?;
+        self.blk_iter = BlockIterator::create_and_seek_to_first(block);
+        self.blk_idx = blk_idx;
+
         Ok(())
     }
 }
@@ -127,8 +130,9 @@ impl StorageIterator for SsTableIterator {
         self.blk_iter.next();
         if !self.blk_iter.is_valid() && self.blk_idx + 1 < self.table.block_meta.len() {
             self.blk_idx += 1;
-            self.blk_iter =
-                BlockIterator::create_and_seek_to_first(self.table.read_block(self.blk_idx)?);
+            self.blk_iter = BlockIterator::create_and_seek_to_first(
+                self.table.read_block_cached(self.blk_idx)?,
+            );
         }
         Ok(())
     }
