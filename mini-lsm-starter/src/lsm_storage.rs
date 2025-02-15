@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::{Bound, Not, Range, RangeBounds};
+use std::ops::{Bound, Not, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -299,15 +299,43 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
+        let state_snapshot = {
+            let state = self.state.read();
+            Arc::clone(&state)
+        };
 
-        if let Some(value) = state.memtable.get(key) {
+        if let Some(value) = state_snapshot.memtable.get(key) {
             return Ok(value.is_empty().not().then_some(value));
         }
 
-        for imm_memtable in &state.imm_memtables {
+        for imm_memtable in &state_snapshot.imm_memtables {
             if let Some(value) = imm_memtable.get(key) {
                 return Ok(value.is_empty().not().then_some(value));
+            }
+        }
+
+        let mut iters = Vec::new();
+        for idx in &state_snapshot.l0_sstables {
+            if let Some(sst_table) = state_snapshot.sstables.get(idx).map(Arc::clone) {
+                let iter = SsTableIterator::create_and_seek_to_first(sst_table)?;
+                if iter.is_valid() {
+                    iters.push(Box::new(iter));
+                }
+            }
+        }
+
+        for idx in &state_snapshot.l0_sstables {
+            let sst_table = match state_snapshot.sstables.get(idx) {
+                Some(sst_table) => sst_table.clone(),
+                None => continue,
+            };
+            let iter =
+                SsTableIterator::create_and_seek_to_key(sst_table, KeySlice::from_slice(key))?;
+            if iter.is_valid() && iter.key().raw_ref() == key {
+                if iter.value() == b"" {
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(iter.value())));
             }
         }
 
@@ -501,5 +529,128 @@ fn has_overlap<Idx: PartialOrd>(r1: (Idx, Idx), r2: (Bound<Idx>, Bound<Idx>)) ->
         // r1: |----|
         // r2: o---o
         (Bound::Excluded(x), Bound::Excluded(y)) => !(y <= m || x >= n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Bound;
+
+    #[test]
+    fn test_has_overlap_deepseek() {
+        // 测试用例 1: r1 和 r2 都是无界的
+        assert!(has_overlap((1, 5), (Bound::Unbounded, Bound::Unbounded)));
+
+        // 测试用例 2: r2 是无界的下界，有界的上界（包含）
+        assert!(has_overlap((1, 5), (Bound::Unbounded, Bound::Included(3))));
+        assert!(!has_overlap((1, 5), (Bound::Unbounded, Bound::Included(0))));
+
+        // 测试用例 3: r2 是无界的下界，有界的上界（排除）
+        assert!(has_overlap((1, 5), (Bound::Unbounded, Bound::Excluded(3))));
+        assert!(!has_overlap((1, 5), (Bound::Unbounded, Bound::Excluded(1))));
+
+        // 测试用例 4: r2 是有界的下界（包含），无界的上界
+        assert!(has_overlap((1, 5), (Bound::Included(3), Bound::Unbounded)));
+        assert!(!has_overlap((1, 5), (Bound::Included(6), Bound::Unbounded)));
+
+        // 测试用例 5: r2 是有界的下界（排除），无界的上界
+        assert!(has_overlap((1, 5), (Bound::Excluded(3), Bound::Unbounded)));
+        assert!(!has_overlap((1, 5), (Bound::Excluded(5), Bound::Unbounded)));
+
+        // 测试用例 6: r2 是有界的下界（包含）和上界（包含）
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Included(3), Bound::Included(4))
+        ));
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Included(6), Bound::Included(7))
+        ));
+
+        // 测试用例 7: r2 是有界的下界（排除）和上界（包含）
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Excluded(0), Bound::Included(3))
+        ));
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Excluded(5), Bound::Included(6))
+        ));
+
+        // 测试用例 8: r2 是有界的下界（包含）和上界（排除）
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Included(3), Bound::Excluded(6))
+        ));
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Included(6), Bound::Excluded(7))
+        ));
+
+        // 测试用例 9: r2 是有界的下界（排除）和上界（排除）
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Excluded(0), Bound::Excluded(6))
+        ));
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Excluded(5), Bound::Excluded(6))
+        ));
+
+        // 测试用例 10: r1 和 r2 完全不重叠
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Included(6), Bound::Included(7))
+        ));
+        assert!(!has_overlap(
+            (1, 5),
+            (Bound::Excluded(5), Bound::Excluded(6))
+        ));
+
+        // 测试用例 11: r1 和 r2 完全重叠
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Included(1), Bound::Included(5))
+        ));
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Excluded(0), Bound::Excluded(6))
+        ));
+
+        // 测试用例 12: r1 和 r2 部分重叠
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Included(3), Bound::Included(7))
+        ));
+        assert!(has_overlap(
+            (1, 5),
+            (Bound::Excluded(0), Bound::Excluded(3))
+        ));
+    }
+
+    #[test]
+    fn test_has_overlap_chatgpt() {
+        use std::ops::Bound::*;
+
+        // Overlapping cases
+        assert!(has_overlap((5, 10), (Unbounded, Unbounded))); // Unbounded range always overlaps
+        assert!(has_overlap((5, 10), (Unbounded, Included(8)))); // Partially overlaps
+        assert!(has_overlap((5, 10), (Included(7), Unbounded))); // Partially overlaps
+        assert!(has_overlap((5, 10), (Included(6), Included(9)))); // Fully inside
+        assert!(has_overlap((5, 10), (Included(10), Included(15)))); // Overlaps at boundary
+        assert!(has_overlap((5, 10), (Excluded(4), Included(6)))); // Overlaps
+        assert!(has_overlap((5, 10), (Excluded(9), Included(12)))); // Overlaps at 10
+
+        // Non-overlapping cases
+        assert!(!has_overlap((5, 10), (Included(11), Included(15)))); // Fully after
+        assert!(!has_overlap((5, 10), (Included(1), Included(4)))); // Fully before
+        assert!(!has_overlap((5, 10), (Excluded(10), Included(15)))); // Touching but not overlapping
+        assert!(!has_overlap((5, 10), (Excluded(4), Excluded(5)))); // Touching but not overlapping
+
+        // Edge cases
+        assert!(has_overlap((5, 10), (Included(5), Included(5)))); // Single element overlap
+        assert!(!has_overlap((5, 10), (Excluded(10), Excluded(11)))); // Touching at exclusive boundary
+        assert!(has_overlap((5, 10), (Included(10), Excluded(11)))); // Touching at inclusive boundary
     }
 }
