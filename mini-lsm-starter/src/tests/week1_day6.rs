@@ -56,8 +56,6 @@ fn test_task1_storage_scan() {
         assert_eq!(state.imm_memtables.len(), 2);
     }
 
-    // Paniced here
-    // 就这一个通不过，下面两个都行，啊啊啊
     check_lsm_iter_result_by_key(
         &mut storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap(),
         vec![

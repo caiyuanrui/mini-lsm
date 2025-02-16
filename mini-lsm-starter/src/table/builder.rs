@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::BufMut;
 
 use super::{BlockMeta, FileObject, SsTable};
@@ -64,7 +64,7 @@ impl SsTableBuilder {
         }
     }
 
-    /// Build block_builder and append the generated block adn metadata to the vector.
+    /// Build block_builder and append the generated block and metadata to the vector.
     /// Will do nothing if current builder is empty
     fn freeze_block_builder(&mut self) {
         if self.builder.is_empty() {
@@ -119,7 +119,8 @@ impl SsTableBuilder {
         bytes.put_u32(self.data.len() as u32);
 
         // create a file and write bytes into it
-        let file = FileObject::create(path.as_ref(), bytes)?;
+        let file = FileObject::create(path.as_ref(), bytes)
+            .map_err(|e| anyhow!("failed to create file {}: {:?}", path.as_ref().display(), e))?;
 
         Ok(SsTable {
             id,
