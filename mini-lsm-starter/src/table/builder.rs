@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use bytes::BufMut;
 
-use super::{BlockMeta, FileObject, SsTable};
+use super::{bloom::Bloom, BlockMeta, FileObject, SsTable};
 use crate::{
     block::{BlockBuilder, BlockIterator},
     key::KeySlice,
@@ -35,6 +35,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -47,6 +48,7 @@ impl SsTableBuilder {
             data: Vec::with_capacity(SST_SIZE),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -55,12 +57,10 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
-        if self.builder.add(key, value) {
-            return;
-        }
-        self.freeze_block_builder();
-        if !self.builder.add(key, value) {
-            unreachable!("what fuk is going on")
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+
+        while !self.builder.add(key, value) {
+            self.freeze_block_builder();
         }
     }
 
@@ -118,19 +118,25 @@ impl SsTableBuilder {
         // put extra metablock offset
         bytes.put_u32(self.data.len() as u32);
 
+        let bloom_filter_offset = bytes.len() as u32;
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+        let bloom_filter = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        bloom_filter.encode(bytes.as_mut());
+        bytes.put_u32(bloom_filter_offset);
+
         // create a file and write bytes into it
         let file = FileObject::create(path.as_ref(), bytes)
             .map_err(|e| anyhow!("failed to create file {}: {:?}", path.as_ref().display(), e))?;
 
         Ok(SsTable {
-            id,
-            first_key,
-            last_key,
-            block_cache,
+            file,
             block_meta: self.meta,
             block_meta_offset: self.data.len(),
-            file,
-            bloom: None,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }

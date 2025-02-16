@@ -150,8 +150,6 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        const BLOCK_META_OFFSET_SIZE: usize = size_of::<u32>();
-
         let mut file_handler = file.0.ok_or(anyhow::anyhow!("file object is none"))?;
         let file_size = file.1;
 
@@ -162,11 +160,18 @@ impl SsTable {
             bytes
         };
 
-        let block_meta_offset = bytes[file_size as usize - BLOCK_META_OFFSET_SIZE..]
+        const BLOOM_OFFSET_SIZE: usize = size_of::<u32>();
+        const BLOCK_META_OFFSET_SIZE: usize = size_of::<u32>();
+
+        let bloom_offset =
+            (&bytes[file_size as usize - BLOCK_META_OFFSET_SIZE..]).get_u32() as usize;
+        let bloom = Bloom::decode(&bytes[bloom_offset..file_size as usize - BLOOM_OFFSET_SIZE])?;
+
+        let block_meta_offset = bytes[bloom_offset - BLOCK_META_OFFSET_SIZE..bloom_offset]
             .as_ref()
             .get_u32() as usize;
         let block_meta = BlockMeta::decode_block_meta(
-            &bytes[block_meta_offset..file_size as usize - BLOCK_META_OFFSET_SIZE],
+            &bytes[block_meta_offset..bloom_offset - BLOCK_META_OFFSET_SIZE],
         );
 
         let first_key = block_meta
@@ -188,7 +193,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0u64,
         })
     }
@@ -283,6 +288,13 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        match self.bloom.as_ref() {
+            None => true,
+            Some(bloom) => bloom.may_contain(farmhash::fingerprint32(key)),
+        }
     }
 }
 

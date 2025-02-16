@@ -38,6 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
+use crate::table::bloom::Bloom;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -320,23 +321,16 @@ impl LsmStorageInner {
             }
         }
 
-        let mut iters = Vec::new();
-        for idx in &state_snapshot.l0_sstables {
-            if let Some(sst_table) = state_snapshot.sstables.get(idx).map(Arc::clone) {
-                let iter = SsTableIterator::create_and_seek_to_first(sst_table)?;
-                if iter.is_valid() {
-                    iters.push(Box::new(iter));
-                }
-            }
-        }
-
         for idx in &state_snapshot.l0_sstables {
             let sst_table = match state_snapshot.sstables.get(idx) {
-                Some(sst_table) => sst_table.clone(),
-                None => continue,
+                Some(sst_table) if sst_table.may_contain_key(key) => sst_table.clone(),
+                _ => continue,
             };
-            let iter =
-                SsTableIterator::create_and_seek_to_key(sst_table, KeySlice::from_slice(key))?;
+
+            let iter = SsTableIterator::create_and_seek_to_key(
+                sst_table.clone(),
+                KeySlice::from_slice(key),
+            )?;
             if iter.is_valid() && iter.key().raw_ref() == key {
                 if iter.value() == b"" {
                     return Ok(None);

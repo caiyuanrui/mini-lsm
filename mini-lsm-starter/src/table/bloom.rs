@@ -141,3 +141,39 @@ impl Bloom {
         }
     }
 }
+
+#[cfg(test)]
+mod my_tests {
+    use super::*;
+
+    fn key(id: usize) -> String {
+        format!("key_{:05}", id)
+    }
+
+    #[test]
+    fn bloom_insert() {
+        let size = 10000;
+        let mut key_hashes = Vec::with_capacity(size);
+
+        for id in 0..size {
+            key_hashes.push(farmhash::fingerprint32(key(id).as_bytes()));
+        }
+
+        let bits_per_key = Bloom::bloom_bits_per_key(size, 0.01);
+        let bloom = Bloom::build_from_key_hashes(&key_hashes, bits_per_key);
+
+        for id in 0..size {
+            assert!(bloom.may_contain(farmhash::fingerprint32(key(id).as_bytes())));
+        }
+
+        let mut false_posotive_cnt = 0;
+        let attempts = 1_000_000;
+        for id in (size..).take(attempts) {
+            if bloom.may_contain(farmhash::fingerprint32(key(id).as_bytes())) {
+                false_posotive_cnt += 1;
+            }
+        }
+
+        assert!((false_posotive_cnt as f64 / attempts as f64) < 0.015);
+    }
+}
