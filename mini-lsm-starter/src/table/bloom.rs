@@ -18,6 +18,10 @@ use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Implements a bloom filter
+///
+/// |------------------------|\
+/// | filter ([u8]) | k (u8) |\
+/// |------------------------|
 pub struct Bloom {
     /// data of filter in bits
     pub(crate) filter: Bytes,
@@ -95,6 +99,20 @@ impl Bloom {
 
         // TODO: build the bloom filter
 
+        // 使用单个 hash 值生成多个 hash 索引
+        // 因为使用 k 个不同的 hash 函数太慢了，通常改用 double hashing
+        // Hi(x) = (H1(x) + i * H2(x)) mod m
+        // H1(x) 是 x 的初始 hash 值，H2(x) 是扰动值
+        for key in keys {
+            let mut h = *key;
+            let delta = h.rotate_left(15);
+            for _ in 0..k {
+                let idx = h as usize % nbits;
+                filter.set_bit(idx, true);
+                h = h.wrapping_add(delta);
+            }
+        }
+
         Self {
             filter: filter.freeze(),
             k: k as u8,
@@ -102,7 +120,7 @@ impl Bloom {
     }
 
     /// Check if a bloom filter may contain some data
-    pub fn may_contain(&self, h: u32) -> bool {
+    pub fn may_contain(&self, mut h: u32) -> bool {
         if self.k > 30 {
             // potential new encoding for short bloom filters
             true
@@ -111,6 +129,13 @@ impl Bloom {
             let delta = h.rotate_left(15);
 
             // TODO: probe the bloom filter
+            for _ in 0..self.k {
+                let idx = h as usize % nbits;
+                if !self.filter.get_bit(idx) {
+                    return false;
+                }
+                h = h.wrapping_add(delta);
+            }
 
             true
         }
