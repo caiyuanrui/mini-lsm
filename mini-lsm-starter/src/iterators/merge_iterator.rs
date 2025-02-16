@@ -130,15 +130,16 @@ where
         Ok(())
     }
 
-    // fn num_active_iterators(&self) -> usize {
-    //     self.iters
-    //         .iter()
-    //         .map(|hw| hw.1.num_active_iterators())
-    //         .sum::<usize>()
-    //         + self
-    //             .current
-    //             .as_ref()
-    //             .map(|hw| hw.1.num_active_iterators())
-    //             .unwrap_or(0)
-    // }
+    /// the sum of `num_active_iterators` of all children iterators
+    fn num_active_iterators(&self) -> usize {
+        self.iters
+            .iter()
+            .map(|hw| hw.1.num_active_iterators())
+            .sum::<usize>()
+            + self
+                .current
+                .as_ref()
+                .map(|hw| hw.1.num_active_iterators())
+                .unwrap_or(0)
+    }
 }

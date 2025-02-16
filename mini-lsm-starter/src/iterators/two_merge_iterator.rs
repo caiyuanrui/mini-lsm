@@ -100,4 +100,9 @@ where
 
         Ok(())
     }
+
+    /// the sum of `num_active_iterators` of all children iterators
+    fn num_active_iterators(&self) -> usize {
+        self.a.num_active_iterators() + self.b.num_active_iterators()
+    }
 }
