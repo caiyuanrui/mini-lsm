@@ -118,6 +118,9 @@ impl SsTableBuilder {
         // put extra metablock offset
         bytes.put_u32(self.data.len() as u32);
 
+        // create a file and write bytes into it
+        let file = FileObject::create(path.as_ref(), bytes)?;
+
         Ok(SsTable {
             id,
             first_key,
@@ -125,7 +128,7 @@ impl SsTableBuilder {
             block_cache,
             block_meta: self.meta,
             block_meta_offset: self.data.len(),
-            file: FileObject::create(path.as_ref(), bytes)?,
+            file,
             bloom: None,
             max_ts: 0,
         })

@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -418,7 +418,35 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let mut snapshot = {
+            let guard = self.state.read();
+            guard.as_ref().clone()
+        };
+
+        // 1. select a memtable to flush
+        let memtable_to_flush = match snapshot.imm_memtables.pop() {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+
+        // 2. create a sst file corresponding to a memtable
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+
+        let path = self.path_of_sst(memtable_to_flush.id());
+        let sst = builder.build(self.next_sst_id(), Some(self.block_cache.clone()), path)?;
+
+        // 3. remove the metable from the imm memtable lists and add the SST file to l0 SSTS
+        // please note that the l0_sstables stores from the latest to the earliest
+        snapshot.l0_sstables.insert(0, sst.sst_id());
+        snapshot.sstables.insert(sst.sst_id(), Arc::new(sst));
+
+        let mut state = self.state.write();
+        *state = Arc::new(snapshot);
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
