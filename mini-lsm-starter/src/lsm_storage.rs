@@ -354,9 +354,9 @@ impl LsmStorageInner {
             state.memtable.put(key, value)?;
         }
 
-        if { self.state.read().memtable.approximate_size() } > self.options.target_sst_size {
+        if { self.state.read().memtable.approximate_size() } >= self.options.target_sst_size {
             let state_lock = self.state_lock.lock();
-            if { self.state.read().memtable.approximate_size() } > self.options.target_sst_size {
+            if { self.state.read().memtable.approximate_size() } >= self.options.target_sst_size {
                 // gonna require write lock on `state`
                 self.force_freeze_memtable(&state_lock)?;
             }

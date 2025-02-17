@@ -94,10 +94,8 @@ impl BlockIterator {
 
     fn load_first_key(&mut self) {
         let key_len = self.block.data[KEY_OVERLAP_LEN_SIZE..].as_ref().get_u16() as usize;
-        println!("key len is {key_len}");
         const FIRST_KEY_BEGIN: usize = KEY_OVERLAP_LEN_SIZE + REST_KEY_LEN_SIZE;
         let key = self.block.data[FIRST_KEY_BEGIN..FIRST_KEY_BEGIN + key_len].to_vec();
-        println!("first key is {}", String::from_utf8(key.clone()).unwrap());
         self.first_key = KeyVec::from_vec(key);
     }
 

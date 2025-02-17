@@ -22,7 +22,7 @@ mod tiered;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -30,8 +30,10 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::StorageIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -123,12 +125,141 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+    /// `compact` does the actual compaction job that merges some SST files and return a set of new SST files.
+    fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        match task {
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                let sstables_snapshot = { &self.state.read().sstables };
+                let mut iters = Vec::new();
+                for idx in l0_sstables.iter().chain(l1_sstables.iter()) {
+                    println!("chained idx: {idx}");
+                    if let Some(table) = sstables_snapshot.get(idx).cloned() {
+                        let iter = SsTableIterator::create_and_seek_to_first(table)?;
+                        iters.push(Box::new(iter));
+                    }
+                }
+
+                let mut iter = MergeIterator::create(iters);
+                let mut builder = SsTableBuilder::new(self.options.block_size);
+                let mut builders = Vec::new();
+
+                while iter.is_valid() {
+                    // please note that we ignored deleted key-value pair here
+                    // because at present we only compact all ssts
+                    // but the same assumption doesn't hold in the future
+                    let (key, value) = (iter.key(), iter.value());
+
+                    println!(
+                        "{} {}",
+                        String::from_utf8_lossy(key.raw_ref()),
+                        String::from_utf8_lossy(value)
+                    );
+
+                    if !key.is_empty() && !value.is_empty() {
+                        builder.add(key, value);
+                    }
+
+                    if builder.estimated_size() >= self.options.target_sst_size {
+                        let builder = std::mem::replace(
+                            &mut builder,
+                            SsTableBuilder::new(self.options.block_size),
+                        );
+                        builders.push(builder);
+                    }
+
+                    iter.next()?;
+                }
+
+                // we cannot do this because the builder might not get freezed yet
+                // which means the extimated size is zero
+                // if builder.estimated_size() > 0 {
+                //     builders.push(builder);
+                // }
+                if !builder.is_empty() {
+                    builders.push(builder);
+                }
+
+                let mut sstables = Vec::new();
+                for builder in builders {
+                    let id = self.next_sst_id();
+                    let block_cache = Some(self.block_cache.clone());
+                    let path = self.path_of_sst(id);
+                    let sst = Arc::new(builder.build(id, block_cache, path)?);
+                    sstables.push(sst);
+                }
+
+                Ok(sstables)
+            }
+            _ => panic!("not support yet"),
+        }
     }
 
+    /// `force_full_compaction` is the compaction trigger that decides which files to compact and update the LSM state.
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let (l0_sstables, l1_sstables) = {
+            let state = self.state.read();
+            assert_eq!(1, state.levels[0].0);
+            (state.l0_sstables.clone(), state.levels[0].1.clone())
+        };
+
+        let task = CompactionTask::ForceFullCompaction {
+            l0_sstables: l0_sstables.clone(),
+            l1_sstables: l1_sstables.clone(),
+        };
+
+        let new_l1_sstables = self.compact(&task)?;
+
+        fn print_state(state: &LsmStorageState) {
+            println!("l0_sstables: {:?}", state.l0_sstables);
+            println!("levels {:?}", state.levels);
+            println!(
+                "sstable indices: {:?}",
+                state.sstables.iter().map(|item| item.0).collect::<Vec<_>>()
+            )
+        }
+
+        {
+            let _state_lock = self.state_lock.lock();
+            let mut state = self.state.write();
+            let mut new_state = state.as_ref().clone();
+            // first, remove compacted l0_ssts' id
+            new_state
+                .l0_sstables
+                .retain(|sst_id| !l0_sstables.contains(sst_id));
+
+            // second, remove l0 and l1 <sst_id, table> pairs
+            new_state.sstables.retain(|sst_id, sstable| {
+                !l0_sstables.contains(sst_id) && !l1_sstables.contains(sst_id)
+            });
+
+            // third, update l1 ssts
+            let mut l1_sst_ids = Vec::new();
+            for sst in new_l1_sstables {
+                l1_sst_ids.push(sst.sst_id());
+                new_state.sstables.insert(sst.sst_id(), sst);
+            }
+            // we assume that the compaction runs in a single thread
+            new_state.levels[0] = (1, l1_sst_ids);
+
+            *state = Arc::new(new_state);
+        }
+
+        // finally, remove tale files
+        for &sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
+            let path = self.path_of_sst(sst_id);
+            if let Err(err) = std::fs::remove_file(path) {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // eprintln!("sst file to be removed not found");
+                } else {
+                    bail!("failed to remove sst file: {:?}", err);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
