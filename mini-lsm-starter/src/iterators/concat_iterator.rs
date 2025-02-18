@@ -55,6 +55,10 @@ impl SstConcatIterator {
     }
 
     fn seek_to_first(&mut self) -> Result<()> {
+        if self.sstables.is_empty() {
+            self.current = None;
+            return Ok(());
+        }
         let table = self.sstables[0].clone();
         self.current = Some(SsTableIterator::create_and_seek_to_first(table)?);
         self.next_sst_idx = 1;
@@ -115,6 +119,6 @@ impl StorageIterator for SstConcatIterator {
     }
 
     fn num_active_iterators(&self) -> usize {
-        1
+        self.sstables.len()
     }
 }

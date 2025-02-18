@@ -30,6 +30,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
@@ -338,6 +339,22 @@ impl LsmStorageInner {
             }
         }
 
+        let l1_sstables = state_snapshot.levels[0]
+            .1
+            .iter()
+            .filter_map(|idx| state_snapshot.sstables.get(idx).cloned())
+            .collect::<Vec<_>>();
+        let l1_concat_iter =
+            SstConcatIterator::create_and_seek_to_key(l1_sstables, KeySlice::from_slice(key))?;
+        // all deleted key-value pairs are removed during compaction
+        // so we don't need to handle the special case that `value == b""`
+        if l1_concat_iter.is_valid() && l1_concat_iter.key().raw_ref() == key {
+            // if l1_concat_iter.value() == b"" {
+            //     return Ok(None);
+            // }
+            return Ok(Some(Bytes::copy_from_slice(l1_concat_iter.value())));
+        }
+
         Ok(None)
     }
 
@@ -511,13 +528,20 @@ impl LsmStorageInner {
             sst_iters.push(Box::new(sst_iter));
         }
 
-        Ok(FusedIterator::new(LsmIterator::new(
-            TwoMergeIterator::create(
-                MergeIterator::create(mt_iters),
-                MergeIterator::create(sst_iters),
-            )?,
-            upper,
-        )?))
+        let l1_sstables = state.levels[0]
+            .1
+            .iter()
+            .filter_map(|idx| state.sstables.get(idx).cloned())
+            .collect::<Vec<_>>();
+        let l1_concate_iter = SstConcatIterator::create_and_seek_to_key(l1_sstables, key_slice)?;
+
+        let a = MergeIterator::create(mt_iters);
+        let b = MergeIterator::create(sst_iters);
+        let mem_and_l0_iter = TwoMergeIterator::create(a, b)?;
+        let l1_iter = MergeIterator::create(vec![Box::new(l1_concate_iter)]);
+        let inner = TwoMergeIterator::create(mem_and_l0_iter, l1_iter)?;
+
+        Ok(FusedIterator::new(LsmIterator::new(inner, upper)?))
     }
 
     pub fn scan_range(&self, range: impl RangeBounds<[u8]>) -> Result<FusedIterator<LsmIterator>> {

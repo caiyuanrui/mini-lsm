@@ -30,7 +30,9 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -135,14 +137,32 @@ impl LsmStorageInner {
                 let sstables_snapshot = { &self.state.read().sstables };
                 let mut iters = Vec::new();
                 for idx in l0_sstables.iter().chain(l1_sstables.iter()) {
-                    // println!("chained idx: {idx}");
                     if let Some(table) = sstables_snapshot.get(idx).cloned() {
                         let iter = SsTableIterator::create_and_seek_to_first(table)?;
                         iters.push(Box::new(iter));
                     }
                 }
 
-                let mut iter = MergeIterator::create(iters);
+                let l0_merge_iter = {
+                    let mut iters = Vec::new();
+                    for table in l0_sstables
+                        .iter()
+                        .filter_map(|idx| sstables_snapshot.get(idx).cloned())
+                    {
+                        iters.push(Box::new(SsTableIterator::create_and_seek_to_first(table)?));
+                    }
+                    MergeIterator::create(iters)
+                };
+                let l1_concate_iter = {
+                    let sstables = l1_sstables
+                        .iter()
+                        .filter_map(|idx| sstables_snapshot.get(idx).cloned())
+                        .collect();
+                    SstConcatIterator::create_and_seek_to_first(sstables)?
+                };
+
+                let mut iter = TwoMergeIterator::create(l0_merge_iter, l1_concate_iter)?;
+                // let mut iter = MergeIterator::create(iters);
                 let mut builder = SsTableBuilder::new(self.options.block_size);
                 let mut builders = Vec::new();
 
