@@ -135,7 +135,7 @@ impl LsmStorageInner {
                 let sstables_snapshot = { &self.state.read().sstables };
                 let mut iters = Vec::new();
                 for idx in l0_sstables.iter().chain(l1_sstables.iter()) {
-                    println!("chained idx: {idx}");
+                    // println!("chained idx: {idx}");
                     if let Some(table) = sstables_snapshot.get(idx).cloned() {
                         let iter = SsTableIterator::create_and_seek_to_first(table)?;
                         iters.push(Box::new(iter));
@@ -152,11 +152,11 @@ impl LsmStorageInner {
                     // but the same assumption doesn't hold in the future
                     let (key, value) = (iter.key(), iter.value());
 
-                    println!(
-                        "{} {}",
-                        String::from_utf8_lossy(key.raw_ref()),
-                        String::from_utf8_lossy(value)
-                    );
+                    // println!(
+                    //     "{} {}",
+                    //     String::from_utf8_lossy(key.raw_ref()),
+                    //     String::from_utf8_lossy(value)
+                    // );
 
                     if !key.is_empty() && !value.is_empty() {
                         builder.add(key, value);
@@ -212,14 +212,14 @@ impl LsmStorageInner {
 
         let new_l1_sstables = self.compact(&task)?;
 
-        fn print_state(state: &LsmStorageState) {
-            println!("l0_sstables: {:?}", state.l0_sstables);
-            println!("levels {:?}", state.levels);
-            println!(
-                "sstable indices: {:?}",
-                state.sstables.iter().map(|item| item.0).collect::<Vec<_>>()
-            )
-        }
+        // fn print_state(state: &LsmStorageState) {
+        //     println!("l0_sstables: {:?}", state.l0_sstables);
+        //     println!("levels {:?}", state.levels);
+        //     println!(
+        //         "sstable indices: {:?}",
+        //         state.sstables.iter().map(|item| item.0).collect::<Vec<_>>()
+        //     )
+        // }
 
         {
             let _state_lock = self.state_lock.lock();
