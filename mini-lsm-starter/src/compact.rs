@@ -208,6 +208,9 @@ impl LsmStorageInner {
                     task.compact_to_bottom_level(),
                     "bottom level mismatch"
                 );
+                println!("task: {:?}", task);
+                println!("dump structure");
+                self.dump_structure();
                 let snapshot = { self.state.read().clone() };
                 match upper_level {
                     // merge >=L1
@@ -255,104 +258,100 @@ impl LsmStorageInner {
 
     /// `force_full_compaction` is the compaction trigger that decides which files to compact and update the LSM state.
     pub fn force_full_compaction(&self) -> Result<()> {
-        let (l0_sstables, l1_sstables) = {
-            let state = self.state.read();
-            assert_eq!(1, state.levels[0].0);
-            (state.l0_sstables.clone(), state.levels[0].1.clone())
-        };
+        // snapshot 中 L0 和 L1 的索引会被更新，sstables 的索引表也会被更新
+        // 但是在此期间，L0 仍然可能有新的数据写入，并且内存中的数据也会被更新如 memtables、imm_memtables
+        // 因此不可以直接用 snapshot 替换 state，而是只替换部分字段
+        let state_lock = self.state_lock.lock();
+        let mut snapshot = { self.state.read().as_ref().clone() };
+
+        let (l0_sstables, l1_sstables) =
+            (snapshot.l0_sstables.clone(), snapshot.levels[0].1.clone());
+        let sstables_to_remove = [l0_sstables.clone(), l1_sstables.clone()].concat();
+
+        debug_assert_eq!(1, snapshot.levels[0].0);
 
         let task = CompactionTask::ForceFullCompaction {
-            l0_sstables: l0_sstables.clone(),
-            l1_sstables: l1_sstables.clone(),
+            l0_sstables: l0_sstables.to_vec(),
+            l1_sstables: l1_sstables.to_vec(),
         };
+        let new_sstables = self.compact(&task)?;
 
-        let new_l1_sstables = self.compact(&task)?;
-
-        {
-            let _state_lock = self.state_lock.lock();
-            let mut state = self.state.write();
-            let mut new_state = state.as_ref().clone();
-            // first, remove compacted l0_ssts' id
-            new_state
-                .l0_sstables
-                .retain(|sst_id| !l0_sstables.contains(sst_id));
-
-            // second, remove l0 and l1 <sst_id, table> pairs
-            new_state.sstables.retain(|sst_id, sstable| {
-                !l0_sstables.contains(sst_id) && !l1_sstables.contains(sst_id)
-            });
-
-            // third, update l1 ssts
-            let mut l1_sst_ids = Vec::new();
-            for sst in new_l1_sstables {
-                l1_sst_ids.push(sst.sst_id());
-                new_state.sstables.insert(sst.sst_id(), sst);
-            }
-            // we assume that the compaction runs in a single thread
-            new_state.levels[0] = (1, l1_sst_ids);
-
-            *state = Arc::new(new_state);
+        // remove indices
+        snapshot.levels[0].1 = new_sstables.iter().map(|table| table.sst_id()).collect();
+        snapshot
+            .l0_sstables
+            .retain(|id| !sstables_to_remove.contains(id));
+        // remove sstables
+        for id in &sstables_to_remove {
+            let result = snapshot.sstables.remove(id);
+            debug_assert!(result.is_some(), "{id}");
+        }
+        // insert sstables (l0 + l1 -> l1)
+        for table in new_sstables {
+            let result = snapshot.sstables.insert(table.sst_id(), table);
+            debug_assert!(result.is_none(), "{}", result.unwrap().sst_id());
         }
 
-        // finally, remove tale files
-        for &sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
-            let path = self.path_of_sst(sst_id);
-            if let Err(err) = std::fs::remove_file(path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    panic!("failed to remove file {sst_id}.sst: {:?}", err);
-                }
-            }
+        let mut state = self.state.write();
+        let mut new_state = state.as_ref().clone();
+        new_state.sstables = snapshot.sstables;
+        new_state.l0_sstables = snapshot.l0_sstables;
+        new_state.levels = snapshot.levels;
+        *state = Arc::new(new_state);
+
+        drop(state);
+        drop(state_lock);
+
+        for id in sstables_to_remove {
+            let path = self.path_of_sst(id);
+            std::fs::remove_file(self.path_of_sst(id))?;
         }
 
         Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        let task = {
-            let snapshot = self.state.read();
-            match self
-                .compaction_controller
-                .generate_compaction_task(&snapshot)
-            {
-                Some(task) => task,
-                None => return Ok(()),
+        let state_lock = self.state_lock.lock();
+        let snapshot = { self.state.read().as_ref().clone() };
+
+        let task = match self
+            .compaction_controller
+            .generate_compaction_task(&snapshot)
+        {
+            Some(task) => task,
+            None => return Ok(()),
+        };
+        let new_sstables = self.compact(&task)?;
+        let output: Vec<usize> = new_sstables.iter().map(|table| table.sst_id()).collect();
+
+        // sstable indices are updated already
+        let (snapshot, sstables_to_remove) = self
+            .compaction_controller
+            .apply_compaction_result(&snapshot, &task, &output, false);
+        let update_sstables = |sstables: &mut std::collections::HashMap<_, _>| {
+            for id in &sstables_to_remove {
+                let result = sstables.remove(id);
+                debug_assert!(result.is_some(), "{id}");
+            }
+            for table in new_sstables {
+                let result = sstables.insert(table.sst_id(), table);
+                debug_assert!(result.is_none(), "{}", result.unwrap().sst_id());
             }
         };
-        let sstables = self.compact(&task)?;
-        // the sstables' ids that are created
-        let output: Vec<usize> = sstables.iter().map(|table| table.sst_id()).collect();
 
-        let _state_lock = self.state_lock.lock();
         let mut state = self.state.write();
+        let mut new_state = state.as_ref().clone();
+        new_state.l0_sstables = snapshot.l0_sstables;
+        new_state.levels = snapshot.levels;
+        update_sstables(&mut new_state.sstables);
+        *state = Arc::new(new_state);
 
-        let (mut snapshot, files_to_remove) = self.compaction_controller.apply_compaction_result(
-            state.as_ref(),
-            &task,
-            &output,
-            false,
-        );
-        // remove the <sst_id, sstable> pairs
-        for id in &files_to_remove {
-            let removed = snapshot.sstables.remove(id);
-            assert!(removed.is_some(), "failed to remove sst {}", id);
-        }
-        // insert the <sst_id, sstable> pairs
-        for table in sstables {
-            let result = snapshot.sstables.insert(table.sst_id(), table);
-            assert!(
-                result.is_none(),
-                "failed to insert sst {}",
-                result.unwrap().sst_id()
-            );
-        }
-
-        *state = Arc::new(snapshot);
+        drop(state);
+        drop(state_lock);
 
         // remove the files from the disk.
-        for id in files_to_remove {
-            if let Err(err) = std::fs::remove_file(self.path_of_sst(id)) {
-                eprintln!("failed to remove file {}.sst{:?}", id, err);
-            }
+        for id in sstables_to_remove {
+            std::fs::remove_file(self.path_of_sst(id))?;
         }
 
         Ok(())
@@ -372,7 +371,7 @@ impl LsmStorageInner {
                 loop {
                     crossbeam_channel::select! {
                         recv(ticker) -> _ => if let Err(e) = this.trigger_compaction() {
-                            eprintln!("compaction failed: {}", e);
+                            log::error!("compaction failed: {}", e);
                         },
                         recv(rx) -> _ => return
                     }
@@ -401,12 +400,58 @@ impl LsmStorageInner {
             loop {
                 crossbeam_channel::select! {
                     recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
-                        eprintln!("flush failed: {}", e);
+                        log::debug!("flush failed: {}", e);
                     },
                     recv(rx) -> _ => return
                 }
             }
         });
         Ok(Some(handle))
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use std::collections::BTreeMap;
+
+    use crate::lsm_storage::{LsmStorageOptions, MiniLsm};
+
+    use super::*;
+    use quickcheck_macros::quickcheck;
+    use tempfile::tempdir;
+
+    fn mock_lsm() -> Arc<MiniLsm> {
+        let dir = tempdir().unwrap();
+        let storage = MiniLsm::open(
+            &dir,
+            LsmStorageOptions::default_for_week2_test(CompactionOptions::Simple(
+                SimpleLeveledCompactionOptions {
+                    level0_file_num_compaction_trigger: 2,
+                    max_levels: 3,
+                    size_ratio_percent: 200,
+                },
+            )),
+        )
+        .unwrap();
+
+        let mut key_map = BTreeMap::<usize, usize>::new();
+        let gen_key = |i| format!("{:010}", i); // 10B
+        let gen_value = |i| format!("{:0110}", i); // 110B
+        let mut max_key = 0;
+        let overlaps = if false { 10000 } else { 20000 };
+        for iter in 0..10 {
+            let range_begin = iter * 5000;
+            for i in range_begin..(range_begin + overlaps) {
+                // 120B per key, 4MB data populated
+                let key: String = gen_key(i);
+                let version = key_map.get(&i).copied().unwrap_or_default() + 1;
+                let value = gen_value(version);
+                key_map.insert(i, version);
+                storage.put(key.as_bytes(), value.as_bytes()).unwrap();
+                max_key = max_key.max(i);
+            }
+        }
+
+        storage
     }
 }

@@ -102,32 +102,23 @@ impl SimpleLeveledCompactionController {
     /// and `sstables` hash map. Though there should only be one thread running compaction jobs, you should think about the case
     /// where an L0 SST gets flushed while the compactor generates new SSTs, and with that in mind, you should do some sanity checks
     /// in your implementation.
-    /// # Return
-    /// (new state, deleted sst ids)
     pub fn apply_compaction_result(
         &self,
         snapshot: &LsmStorageState,
         task: &SimpleLeveledCompactionTask,
-        // list of SST ids
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
         let mut new_state = snapshot.clone();
         if let Some(upper) = task.upper_level {
-            assert_eq!(
+            debug_assert_eq!(
                 snapshot.levels[upper - 1].1,
                 task.upper_level_sst_ids,
-                "sst >=L1 mismatched"
+                "L{upper} mismatched"
             );
             new_state.levels[upper - 1]
                 .1
                 .retain(|id| !task.upper_level_sst_ids.contains(id));
         } else {
-            // this assumption is incorrect, the l0 level is not sorted,
-            // and the l0 flush happens even though the compaction is running
-            // assert_eq!(
-            //     snapshot.l0_sstables, task.upper_level_sst_ids,
-            //     "sst mismatched",
-            // );
             new_state
                 .l0_sstables
                 .retain(|id| !task.upper_level_sst_ids.contains(id));
