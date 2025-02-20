@@ -82,12 +82,6 @@ impl SimpleLeveledCompactionController {
             };
 
             if size_ratio_percent < self.options.size_ratio_percent {
-                // println!(
-                //     "compaction triggered at level {} and {} with size ratio {}",
-                //     i,
-                //     lower_level,
-                //     size_ratio_percent as f64 / 100.0
-                // );
                 return Some(SimpleLeveledCompactionTask {
                     upper_level: Some(upper_level),
                     upper_level_sst_ids: snapshot.levels[upper_level - 1].1.clone(),
@@ -118,21 +112,22 @@ impl SimpleLeveledCompactionController {
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
         let mut new_state = snapshot.clone();
-
         if let Some(upper) = task.upper_level {
             assert_eq!(
                 snapshot.levels[upper - 1].1,
                 task.upper_level_sst_ids,
-                "sst mismatched"
+                "sst >=L1 mismatched"
             );
             new_state.levels[upper - 1]
                 .1
                 .retain(|id| !task.upper_level_sst_ids.contains(id));
         } else {
-            assert_eq!(
-                snapshot.l0_sstables, task.upper_level_sst_ids,
-                "sst mismatched"
-            );
+            // this assumption is incorrect, the l0 level is not sorted,
+            // and the l0 flush happens even though the compaction is running
+            // assert_eq!(
+            //     snapshot.l0_sstables, task.upper_level_sst_ids,
+            //     "sst mismatched",
+            // );
             new_state
                 .l0_sstables
                 .retain(|id| !task.upper_level_sst_ids.contains(id));
@@ -141,13 +136,13 @@ impl SimpleLeveledCompactionController {
         // replace the lower level with the list of SST ids which is newly-built
         new_state.levels[task.lower_level - 1].1 = output.to_vec();
 
-        let del_sst_ids = task
+        let files_to_remove = task
             .upper_level_sst_ids
             .iter()
             .chain(task.lower_level_sst_ids.iter())
             .copied()
             .collect();
 
-        (new_state, del_sst_ids)
+        (new_state, files_to_remove)
     }
 }
