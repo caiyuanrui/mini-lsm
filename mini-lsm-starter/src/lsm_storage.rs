@@ -187,7 +187,10 @@ impl MiniLsm {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        env_logger::init();
+        env_logger::builder()
+            .format_file(true)
+            .format_line_number(true)
+            .init();
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
@@ -368,7 +371,7 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // put things into the memtable, and drop the read lock on LSM state
+        assert!(!key.is_empty(), "key cannot be empty");
         {
             let state = self.state.read();
             state.memtable.put(key, value)?;
@@ -413,56 +416,57 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        // Protected by _state_lock_observer
-        // `create_with_wal` involves I/O operations, which might takes 1 millisecond.
-        // In this way, other threads can modify the `state` concurrently when we are creating a new memtable.
         let next_id = self.next_sst_id();
         let next_memtable = Arc::new(MemTable::create(next_id));
 
-        {
-            // Protected by write lockguard, only one thread can access `state`
-            let mut lock = self.state.write();
-            // This is a brand-new state, but every field still points to the original address
-            let mut state_cloned = lock.as_ref().clone();
+        let mut guard = self.state.write();
+        let mut snapshot = guard.as_ref().clone();
 
-            // 1. Replace the current memtable with the new one
-            let old_memtable = std::mem::replace(&mut state_cloned.memtable, next_memtable);
-            // 2. Insert the current memtable into the head of the immu_memtables
-            state_cloned.imm_memtables.insert(0, old_memtable);
-            // 3. Update the self's state with the new one
-            *lock = Arc::new(state_cloned);
-        }
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, next_memtable);
+        snapshot.imm_memtables.insert(0, old_memtable);
+        *guard = Arc::new(snapshot);
 
         Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        let _state_lock = self.state_lock.lock();
+        let state_lock = self.state_lock.lock();
 
-        let mut state = self.state.write();
-        let mut snapshot = state.as_ref().clone();
-
-        // 1. select a memtable to flush
-        let memtable_to_flush = match snapshot.imm_memtables.pop() {
-            Some(value) => value,
-            None => return Ok(()),
+        let memtable_to_flush = {
+            let state = self.state.read();
+            match state.imm_memtables.last() {
+                Some(value) => value.clone(),
+                None => return Ok(()),
+            }
         };
 
-        // 2. create a sst file corresponding to a memtable
         let mut builder = SsTableBuilder::new(self.options.block_size);
         memtable_to_flush.flush(&mut builder)?;
+        let sst_id = memtable_to_flush.id();
+        let sst = Arc::new(builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?);
 
-        let id = self.next_sst_id();
-        let path = self.path_of_sst(id);
-        let sst = builder.build(id, Some(self.block_cache.clone()), path)?;
+        let log_first_key = sst.first_key().raw_ref().to_vec();
+        let log_last_key = sst.last_key().raw_ref().to_vec();
 
-        // 3. remove the metable from the imm memtable lists and add the SST file to l0 SSTS
-        // please note that the l0_sstables stores from the latest to the earliest
-        snapshot.l0_sstables.insert(0, sst.sst_id());
-        snapshot.sstables.insert(sst.sst_id(), Arc::new(sst));
+        let mut guard = self.state.write();
+        let mut snapshot = guard.as_ref().clone();
 
-        *state = Arc::new(snapshot);
+        snapshot.imm_memtables.retain(|x| x.id() != sst_id);
+        snapshot.l0_sstables.insert(0, sst_id);
+        snapshot.sstables.insert(sst_id, sst);
+
+        *guard = Arc::new(snapshot);
+
+        // let first_key = String::from_utf8(log_first_key);
+        // let last_key = String::from_utf8(log_last_key);
+        // log::debug!(
+        //     "sst{sst_id} was flushed into the l0 level, the key range is {first_key:?}~{last_key:?}"
+        // );
 
         Ok(())
     }

@@ -66,7 +66,7 @@ impl SstConcatIterator {
     }
 
     fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
-        self.next_sst_idx = self
+        let idx = self
             .sstables
             .binary_search_by(|sst| {
                 if sst.first_key().as_key_slice() > key {
@@ -78,11 +78,14 @@ impl SstConcatIterator {
                 }
             })
             .unwrap_or_else(std::convert::identity);
-        if self.next_sst_idx >= self.sstables.len() {
+
+        if idx >= self.sstables.len() {
             self.current = None;
             return Ok(());
         }
-        let table = self.sstables[self.next_sst_idx].clone();
+
+        self.next_sst_idx = idx + 1;
+        let table = self.sstables[idx].clone();
         self.current = Some(SsTableIterator::create_and_seek_to_key(table, key)?);
         Ok(())
     }
@@ -107,18 +110,84 @@ impl StorageIterator for SstConcatIterator {
 
     fn next(&mut self) -> Result<()> {
         if let Some(current_iter) = self.current.as_mut() {
-            if !current_iter.is_valid() && self.next_sst_idx < self.sstables.len() {
+            current_iter.next()?;
+
+            while !current_iter.is_valid() && self.next_sst_idx < self.sstables.len() {
                 let table = self.sstables[self.next_sst_idx].clone();
                 *current_iter = SsTableIterator::create_and_seek_to_first(table)?;
                 self.next_sst_idx += 1;
-            } else {
-                current_iter.next()?;
             }
         }
+
         Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
-        self.sstables.len()
+        1
+    }
+}
+
+#[cfg(test)]
+mod my_tests {
+
+    use tempfile::{tempdir, TempDir};
+
+    use crate::{key::KeyVec, table::SsTableBuilder};
+
+    use super::*;
+
+    fn key_of(idx: usize) -> KeyVec {
+        KeyVec::for_testing_from_vec_no_ts(format!("key_{:06}", idx).into_bytes())
+    }
+
+    fn value_of(idx: usize) -> Vec<u8> {
+        format!("value_{:0104}", idx).into_bytes()
+    }
+
+    fn generate_sst() -> (TempDir, SsTable) {
+        let mut builder = SsTableBuilder::new(128);
+        for idx in 0..5000 {
+            let key = key_of(idx);
+            let value = value_of(idx);
+            builder.add(key.as_key_slice(), &value[..]);
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        (dir, builder.build_for_test(path).unwrap())
+    }
+
+    #[test]
+    fn test_concat_iterator() {
+        let mut temp_dirs = Vec::new();
+        let mut sstables = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..10 {
+            let mut builder = SsTableBuilder::new(128);
+            for idx in i * 5000..(i + 1) * 5000 {
+                let key = key_of(idx);
+                let value = value_of(idx);
+                builder.add(key.as_key_slice(), &value[..]);
+                expected.push((key, value));
+            }
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("1.sst");
+            temp_dirs.push(dir);
+            sstables.push(Arc::new(builder.build_for_test(path).unwrap()));
+        }
+
+        let mut iter = SstConcatIterator::create_and_seek_to_first(sstables).unwrap();
+
+        for (expected_key, expected_value) in expected {
+            assert!(
+                iter.is_valid(),
+                "{} {}",
+                String::from_utf8(expected_key.raw_ref().to_vec()).unwrap(),
+                String::from_utf8(expected_value.to_vec()).unwrap()
+            );
+            assert_eq!(expected_key.as_key_slice(), iter.key());
+            assert_eq!(expected_value.as_slice(), iter.value());
+            iter.next().unwrap();
+        }
+        assert!(!iter.is_valid());
     }
 }
