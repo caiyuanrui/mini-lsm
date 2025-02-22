@@ -466,12 +466,6 @@ impl LsmStorageInner {
 
         *guard = Arc::new(snapshot);
 
-        // let first_key = String::from_utf8(log_first_key);
-        // let last_key = String::from_utf8(log_last_key);
-        // log::debug!(
-        //     "sst{sst_id} was flushed into the l0 level, the key range is {first_key:?}~{last_key:?}"
-        // );
-
         Ok(())
     }
 
