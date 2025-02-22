@@ -30,7 +30,9 @@ pub struct TieredCompactionOptions {
     pub max_size_amplification_percent: usize,
     // (this tier - sum of all previous tiers) / sum of all previous tiers
     pub size_ratio: usize,
+    // triggered by size ratio only when more than `min_merge_width` tiers are to be compacted
     pub min_merge_width: usize,
+    // triggered by reducing sorted runs when the number of tiers > `max_merge_width`
     pub max_merge_width: Option<usize>,
 }
 
@@ -66,7 +68,7 @@ impl TieredCompactionController {
         debug_assert!(last_level_size != 0);
         let size_amplification_percent = other_levels_size * 100 / last_level_size;
         if size_amplification_percent >= self.options.max_size_amplification_percent {
-            println!(
+            log::debug!(
                 "compaction triggered by space amplification ratio: {size_amplification_percent}"
             );
             return Some(TieredCompactionTask {
@@ -83,7 +85,7 @@ impl TieredCompactionController {
                     break;
                 }
                 let tiers: Vec<_> = snapshot.levels.iter().take(i).cloned().collect();
-                println!(
+                log::debug!(
                     "compaction triggered by size ratio: {value} > {}",
                     100 + self.options.size_ratio
                 );
@@ -100,7 +102,7 @@ impl TieredCompactionController {
             .max_merge_width
             .is_some_and(|max_merge_width| current_num_iters > max_merge_width)
         {
-            println!("compaction triggered by reducing sorted runs");
+            log::debug!("compaction triggered by reducing sorted runs");
             return Some(TieredCompactionTask {
                 tiers: snapshot.levels.clone(),
                 bottom_tier_included: true,
@@ -116,23 +118,35 @@ impl TieredCompactionController {
         task: &TieredCompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        debug_assert_eq!(snapshot.levels[..task.tiers.len()], task.tiers);
-        // remove task.tiers from snapshot and then insert output into the levels at the index 0
+        debug_assert!(snapshot.levels.len() >= task.tiers.len());
 
         let mut state = snapshot.clone();
-        let mut files_to_remove = Vec::new();
-
-        // all tiers => bottom tiers
-        // remove all levels then add one tier: bottome level
-        for (_, tiers_to_remove) in &task.tiers {
-            files_to_remove.extend_from_slice(tiers_to_remove);
+        let mut files_to_remove = Vec::with_capacity(task.tiers.iter().map(|x| x.1.len()).sum());
+        for (_, x) in &task.tiers {
+            files_to_remove.extend(x);
         }
+
+        // these are the tiers flushed after the task is spawned
+        let new_tiers_end_at = (0..snapshot.levels.len())
+            .find(|&i| snapshot.levels[i].0 == task.tiers[0].0)
+            .unwrap();
+
+        debug_assert_eq!(
+            snapshot.levels[new_tiers_end_at..new_tiers_end_at + task.tiers.len()],
+            task.tiers
+        );
+        debug_assert_eq!(
+            new_tiers_end_at + task.tiers.len() == snapshot.levels.len(),
+            task.bottom_tier_included
+        );
+
         let mut new_tiers = Vec::with_capacity(snapshot.levels.len());
+        new_tiers.extend_from_slice(&snapshot.levels[..new_tiers_end_at]);
         new_tiers.push((output[0], output.to_vec()));
-        new_tiers.extend_from_slice(&snapshot.levels[task.tiers.len()..]);
-
+        if !task.bottom_tier_included {
+            new_tiers.extend_from_slice(&snapshot.levels[new_tiers_end_at + task.tiers.len()..]);
+        }
         state.levels = new_tiers;
-
         (state, files_to_remove)
     }
 }

@@ -111,10 +111,10 @@ impl CompactionController {
 
 impl CompactionController {
     pub fn flush_to_l0(&self) -> bool {
-        matches!(
-            self,
-            Self::Leveled(_) | Self::Simple(_) | Self::NoCompaction
-        )
+        match self {
+            Self::Leveled(_) | Self::Simple(_) | Self::NoCompaction => true,
+            Self::Tiered(_) => false,
+        }
     }
 }
 
@@ -129,54 +129,6 @@ pub enum CompactionOptions {
     Simple(SimpleLeveledCompactionOptions),
     /// In no compaction mode (week 1), always flush to L0
     NoCompaction,
-}
-
-fn get_first_last_key_from_iter_for_debug(
-    mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
-) -> (String, String) {
-    let mut first_key = Vec::new();
-    let mut last_key = Vec::new();
-    while iter.is_valid() {
-        last_key = iter.key().raw_ref().to_vec();
-        if first_key.is_empty() {
-            first_key = iter.key().raw_ref().to_vec();
-        }
-        iter.next().unwrap();
-    }
-    (
-        String::from_utf8(first_key).unwrap(),
-        String::from_utf8(last_key).unwrap(),
-    )
-}
-
-fn print_levels_for_debug(snapshot: &LsmStorageState) {
-    let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
-    let mut key_ranges: Vec<(String, String)> = Vec::new();
-    for sst_id in &snapshot.l0_sstables {
-        let sst = &snapshot.sstables[sst_id];
-        let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
-        let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
-        key_ranges.push((key, value));
-    }
-    levels.push((0, key_ranges));
-
-    for (level, sst_ids) in &snapshot.levels {
-        let mut key_ranges: Vec<(String, String)> = Vec::new();
-        for sst_id in sst_ids {
-            let sst = &snapshot.sstables[sst_id];
-            let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
-            let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
-            key_ranges.push((key, value));
-        }
-        levels.push((*level, key_ranges));
-    }
-
-    for (level, key_ranges) in levels {
-        log::debug!("========== L{level} ==========");
-        for (k1, k2) in key_ranges {
-            log::debug!("{k1} {k2}");
-        }
-    }
 }
 
 impl LsmStorageInner {
@@ -219,6 +171,7 @@ impl LsmStorageInner {
     }
 
     /// `compact` does the actual compaction job that merges some SST files and return a set of new SST files.
+    /// We do not hold state lock before the `compact` function executed. Handle the state carefully if the new ssts are flushed.
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         match task {
             CompactionTask::ForceFullCompaction {
@@ -294,55 +247,64 @@ impl LsmStorageInner {
                     }
                 }
             }
+            CompactionTask::Tiered(TieredCompactionTask {
+                tiers,
+                bottom_tier_included,
+            }) => {
+                let snapshot = { self.state.read().clone() };
+                let iter = {
+                    let mut iters = Vec::new();
+                    for (_, files_to_merge) in tiers {
+                        iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                            files_to_merge
+                                .iter()
+                                .map(|x| snapshot.sstables[x].clone())
+                                .collect(),
+                        )?));
+                    }
+                    MergeIterator::create(iters)
+                };
+                self.compact_with_iter(iter, task.compact_to_bottom_level())
+            }
             _ => panic!("not support yet"),
         }
     }
 
     /// `force_full_compaction` is the compaction trigger that decides which files to compact and update the LSM state.
     pub fn force_full_compaction(&self) -> Result<()> {
-        // snapshot 中 L0 和 L1 的索引会被更新，sstables 的索引表也会被更新
-        // 但是在此期间，L0 仍然可能有新的数据写入，并且内存中的数据也会被更新如 memtables、imm_memtables
-        // 因此不可以直接用 snapshot 替换 state，而是只替换部分字段
-        let state_lock = self.state_lock.lock();
-        let mut snapshot = { self.state.read().as_ref().clone() };
+        let snapshot = { self.state.read().as_ref().clone() };
 
         let (l0_sstables, l1_sstables) =
             (snapshot.l0_sstables.clone(), snapshot.levels[0].1.clone());
         let sstables_to_remove = [l0_sstables.clone(), l1_sstables.clone()].concat();
 
-        debug_assert_eq!(1, snapshot.levels[0].0);
-
         let task = CompactionTask::ForceFullCompaction {
-            l0_sstables: l0_sstables.to_vec(),
-            l1_sstables: l1_sstables.to_vec(),
+            l0_sstables: l0_sstables.clone(),
+            l1_sstables: l1_sstables.clone(),
         };
         let new_sstables = self.compact(&task)?;
 
-        // remove indices
-        snapshot.levels[0].1 = new_sstables.iter().map(|table| table.sst_id()).collect();
-        snapshot
-            .l0_sstables
-            .retain(|id| !sstables_to_remove.contains(id));
-        // remove sstables
-        for id in &sstables_to_remove {
-            let result = snapshot.sstables.remove(id);
-            debug_assert!(result.is_some(), "{id}");
-        }
-        // insert sstables (l0 + l1 -> l1)
-        for table in new_sstables {
-            let result = snapshot.sstables.insert(table.sst_id(), table);
-            debug_assert!(result.is_none(), "{}", result.unwrap().sst_id());
-        }
+        {
+            let _state_lock = self.state_lock.lock();
+            let mut state = self.state.read().as_ref().clone();
+            // remove indices
+            state.levels[0].1 = new_sstables.iter().map(|table| table.sst_id()).collect();
+            state
+                .l0_sstables
+                .retain(|id| !sstables_to_remove.contains(id));
+            // remove sstables
+            for id in &sstables_to_remove {
+                let result = state.sstables.remove(id);
+                debug_assert!(result.is_some(), "{id}");
+            }
+            // insert sstables (l0 + l1 -> l1)
+            for table in new_sstables {
+                let result = state.sstables.insert(table.sst_id(), table);
+                debug_assert!(result.is_none(), "{}", result.unwrap().sst_id());
+            }
 
-        let mut state = self.state.write();
-        let mut new_state = state.as_ref().clone();
-        new_state.sstables = snapshot.sstables;
-        new_state.l0_sstables = snapshot.l0_sstables;
-        new_state.levels = snapshot.levels;
-        *state = Arc::new(new_state);
-
-        drop(state);
-        drop(state_lock);
+            *self.state.write() = Arc::new(state);
+        }
 
         for id in sstables_to_remove {
             std::fs::remove_file(self.path_of_sst(id))?;
@@ -454,4 +416,54 @@ impl LsmStorageInner {
         });
         Ok(Some(handle))
     }
+}
+
+#[cfg(any(debug_assertions, test))]
+fn print_levels_for_debug(snapshot: &LsmStorageState) {
+    let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    let mut key_ranges: Vec<(String, String)> = Vec::new();
+    for sst_id in &snapshot.l0_sstables {
+        let sst = &snapshot.sstables[sst_id];
+        let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
+        let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
+        key_ranges.push((key, value));
+    }
+    levels.push((0, key_ranges));
+
+    for (level, sst_ids) in &snapshot.levels {
+        let mut key_ranges: Vec<(String, String)> = Vec::new();
+        for sst_id in sst_ids {
+            let sst = &snapshot.sstables[sst_id];
+            let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
+            let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
+            key_ranges.push((key, value));
+        }
+        levels.push((*level, key_ranges));
+    }
+
+    for (level, key_ranges) in levels {
+        log::debug!("========== L{level} ==========");
+        for (k1, k2) in key_ranges {
+            log::debug!("{k1} {k2}");
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
+fn get_first_last_key_from_iter_for_debug(
+    mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+) -> (String, String) {
+    let mut first_key = Vec::new();
+    let mut last_key = Vec::new();
+    while iter.is_valid() {
+        last_key = iter.key().raw_ref().to_vec();
+        if first_key.is_empty() {
+            first_key = iter.key().raw_ref().to_vec();
+        }
+        iter.next().unwrap();
+    }
+    (
+        String::from_utf8(first_key).unwrap(),
+        String::from_utf8(last_key).unwrap(),
+    )
 }
