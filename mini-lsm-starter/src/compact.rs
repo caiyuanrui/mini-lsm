@@ -273,7 +273,6 @@ impl LsmStorageInner {
                 };
                 self.compact_with_iter(iter, task.compact_to_bottom_level())
             }
-            _ => panic!("not support yet"),
         }
     }
 
