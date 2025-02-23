@@ -118,9 +118,11 @@ impl MemTable {
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
         self.approximate_size.fetch_add(
             value.len() + key.len(),
-            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
         );
-
+        if let Some(wal) = self.wal.as_ref() {
+            wal.put(key, value)?;
+        }
         Ok(())
     }
 
