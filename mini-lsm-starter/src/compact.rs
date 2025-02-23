@@ -36,6 +36,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -289,12 +290,13 @@ impl LsmStorageInner {
             l1_sstables: l1_sstables.clone(),
         };
         let new_sstables = self.compact(&task)?;
+        let ids: Vec<usize> = new_sstables.iter().map(|x| x.sst_id()).collect();
 
         {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut state = self.state.read().as_ref().clone();
             // remove indices
-            state.levels[0].1 = new_sstables.iter().map(|table| table.sst_id()).collect();
+            state.levels[0].1 = ids.clone();
             state
                 .l0_sstables
                 .retain(|id| !sstables_to_remove.contains(id));
@@ -310,6 +312,11 @@ impl LsmStorageInner {
             }
 
             *self.state.write() = Arc::new(state);
+            self.sync_dir()?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&state_lock, ManifestRecord::Compaction(task, ids))?;
         }
 
         for id in sstables_to_remove {
@@ -333,11 +340,9 @@ impl LsmStorageInner {
         let output: Vec<usize> = sstables.iter().map(|x| x.sst_id()).collect();
 
         let ssts_to_remove = {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
-            let mut new_sst_ids = Vec::new();
             for sst_to_add in &sstables {
-                new_sst_ids.push(sst_to_add.sst_id());
                 let result = snapshot
                     .sstables
                     .insert(sst_to_add.sst_id(), sst_to_add.clone());
@@ -355,15 +360,17 @@ impl LsmStorageInner {
             }
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
+            drop(state);
+
+            self.sync_dir()?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&state_lock, ManifestRecord::Compaction(task, output))?;
+
             ssts_to_remove
         };
 
-        log::debug!(
-            "compaction finished: {} files removed, {} files added, output={:?}",
-            ssts_to_remove.len(),
-            output.len(),
-            output
-        );
         for sst in ssts_to_remove {
             std::fs::remove_file(self.path_of_sst(sst.sst_id()))?;
         }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
@@ -35,15 +36,16 @@ pub enum ManifestRecord {
 
 impl Manifest {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map(|file| Self {
-                file: Arc::new(Mutex::new(file)),
-            })
-            .with_context(|| format!("failed to open manifest file {}", path.display()))
+        Ok(Self {
+            file: Arc::new(Mutex::new(
+                OpenOptions::new()
+                    .read(true)
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .context("failed to create manifest")?,
+            )),
+        })
     }
 
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
