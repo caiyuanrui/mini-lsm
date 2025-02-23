@@ -49,18 +49,23 @@ impl Manifest {
     }
 
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        let f = std::fs::File::open(path.as_ref())?;
-        let reader = std::io::BufReader::new(f);
-        let stream = serde_json::Deserializer::from_reader(reader).into_iter::<ManifestRecord>();
-        let mut records = Vec::new();
-        for value in stream {
-            records.push(value?);
-        }
         let file = std::fs::OpenOptions::new()
+            .read(true)
             .append(true)
             .open(path)
-            .map(|file| Arc::new(Mutex::new(file)))?;
-        Ok((Self { file }, records))
+            .context("failed to recover manifest file")?;
+        let reader = std::io::BufReader::new(file.try_clone()?);
+        let mut records = Vec::new();
+        for value in serde_json::Deserializer::from_reader(reader).into_iter() {
+            records.push(value?);
+        }
+
+        Ok((
+            Self {
+                file: Arc::new(Mutex::new(file)),
+            },
+            records,
+        ))
     }
 
     pub fn add_record(

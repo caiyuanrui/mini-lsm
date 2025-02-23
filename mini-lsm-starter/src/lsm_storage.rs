@@ -15,12 +15,12 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::{Bound, Not, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -40,7 +40,18 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
+
+static LOGGER: OnceLock<()> = OnceLock::new();
+
+fn init_logger() {
+    LOGGER.get_or_init(|| {
+        env_logger::builder()
+            .format_file(true)
+            .format_line_number(true)
+            .init();
+    });
+}
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -212,10 +223,7 @@ impl MiniLsm {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        env_logger::builder()
-            .format_file(true)
-            .format_line_number(true)
-            .init();
+        init_logger();
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
@@ -297,8 +305,9 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
-        let state = LsmStorageState::create(&options);
+        let mut state = LsmStorageState::create(&options);
         let block_cache = Arc::new(BlockCache::new(1024));
+        let mut next_sst_id = 1;
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -317,14 +326,67 @@ impl LsmStorageInner {
             std::fs::create_dir_all(path).context("failed to create DB directory")?;
         }
         let manifest_path = path.join("MANIFEST");
-        let manifest = if !manifest_path.exists() {
-            let manifest = Manifest::create(manifest_path)?;
+        let manifest;
+        if !manifest_path.exists() {
+            manifest = Manifest::create(manifest_path)?;
             manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
-            manifest
         } else {
-            let (manifest, records) = Manifest::recover(manifest_path)?;
+            let (m, records) = Manifest::recover(manifest_path)?;
+            manifest = m;
+
+            let mut memtables = BTreeSet::new();
             // TODO: recovery
-            manifest
+            for record in records {
+                match record {
+                    ManifestRecord::Flush(sst_id) => {
+                        let res = memtables.remove(&sst_id);
+                        assert!(res, "memtable doesn't exist");
+                        if compaction_controller.flush_to_l0() {
+                            state.l0_sstables.insert(0, sst_id);
+                        } else {
+                            // tiered compaction stragety
+                            state.levels.insert(0, (sst_id, vec![sst_id]));
+                        }
+                        next_sst_id = next_sst_id.max(sst_id);
+                    }
+                    ManifestRecord::NewMemtable(sst_id) => {
+                        next_sst_id = next_sst_id.max(sst_id);
+                        memtables.insert(sst_id);
+                    }
+                    ManifestRecord::Compaction(task, output) => {
+                        let (new_state, sst_ids) = compaction_controller
+                            .apply_compaction_result(&state, &task, &output, true);
+                        state = new_state;
+                        next_sst_id =
+                            next_sst_id.max(output.iter().max().copied().unwrap_or_default());
+                    }
+                }
+            }
+            // recover SSTs
+            let mut sst_cnt = 0;
+            for &sst_id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|x| x.1.iter()))
+            {
+                let sst = Arc::new(SsTable::open(
+                    sst_id,
+                    Some(block_cache.clone()),
+                    FileObject::open(&Self::path_of_sst_static(path, sst_id))?,
+                )?);
+                state.sstables.insert(sst_id, sst);
+                sst_cnt += 1;
+            }
+            println!("{sst_cnt} SSTs opened");
+
+            next_sst_id += 1;
+
+            // sort each level for leveled compaction
+            if let CompactionController::Leveled(_) = compaction_controller {
+                for (_, sst_ids) in state.levels.iter_mut() {
+                    sst_ids.sort_unstable_by_key(|x| state.sstables[x].first_key());
+                }
+            }
         };
 
         let storage = Self {
@@ -332,13 +394,14 @@ impl LsmStorageInner {
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
             block_cache,
-            next_sst_id: AtomicUsize::new(1),
+            next_sst_id: AtomicUsize::new(next_sst_id),
             compaction_controller,
             manifest: Some(manifest),
             options: Arc::new(options),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
+        storage.sync_dir()?;
 
         Ok(storage)
     }

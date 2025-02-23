@@ -181,7 +181,7 @@ impl LeveledCompactionController {
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
         output: &[usize],
-        _in_recovery: bool,
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut state = snapshot.clone();
         let files_to_remove = [
@@ -202,7 +202,9 @@ impl LeveledCompactionController {
         let lower_level_mut = &mut state.levels[task.lower_level - 1].1;
         lower_level_mut.retain(|x| !task.lower_level_sst_ids.contains(x));
         lower_level_mut.extend_from_slice(output);
-        lower_level_mut.sort_unstable_by_key(|x| snapshot.sstables[x].first_key());
+        if !in_recovery {
+            lower_level_mut.sort_unstable_by_key(|x| snapshot.sstables[x].first_key());
+        }
 
         (state, files_to_remove)
     }
