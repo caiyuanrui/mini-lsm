@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 
 use crate::block::Block;
 use crate::compact::{
@@ -363,21 +364,29 @@ impl LsmStorageInner {
                 }
             }
             // recover SSTs
-            let mut sst_cnt = 0;
-            for &sst_id in state
+            let sst_cnt = AtomicUsize::new(0);
+            let results: Result<Vec<_>> = state
                 .l0_sstables
                 .iter()
                 .chain(state.levels.iter().flat_map(|x| x.1.iter()))
-            {
-                let sst = Arc::new(SsTable::open(
-                    sst_id,
-                    Some(block_cache.clone()),
-                    FileObject::open(&Self::path_of_sst_static(path, sst_id))?,
-                )?);
+                .par_bridge()
+                .map(|&sst_id| {
+                    let sst = Arc::new(SsTable::open(
+                        sst_id,
+                        Some(block_cache.clone()),
+                        FileObject::open(&Self::path_of_sst_static(path, sst_id))?,
+                    )?);
+                    sst_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>((sst_id, sst))
+                })
+                .collect();
+            for (sst_id, sst) in results? {
                 state.sstables.insert(sst_id, sst);
-                sst_cnt += 1;
             }
-            println!("{sst_cnt} SSTs opened");
+            println!(
+                "{} SSTs opened",
+                sst_cnt.load(std::sync::atomic::Ordering::Relaxed)
+            );
 
             next_sst_id += 1;
 
