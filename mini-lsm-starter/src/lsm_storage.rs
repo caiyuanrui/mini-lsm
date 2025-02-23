@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{ParallelBridge, ParallelIterator};
 
 use crate::block::Block;
 use crate::compact::{
@@ -336,7 +336,6 @@ impl LsmStorageInner {
             manifest = m;
 
             let mut memtables = BTreeSet::new();
-            // TODO: recovery
             for record in records {
                 match record {
                     ManifestRecord::Flush(sst_id) => {
@@ -396,7 +395,7 @@ impl LsmStorageInner {
                     sst_ids.sort_unstable_by_key(|x| state.sstables[x].first_key());
                 }
             }
-        };
+        }
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
