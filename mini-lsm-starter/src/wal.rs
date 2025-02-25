@@ -91,4 +91,8 @@ impl Wal {
         file.get_mut().sync_all()?; // sync content and metadata
         Ok(())
     }
+
+    pub fn size(&self) -> u64 {
+        self.file.lock().get_ref().metadata().unwrap().len()
+    }
 }

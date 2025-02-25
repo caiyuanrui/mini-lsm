@@ -546,12 +546,16 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Note that we don't acquire the state lock in this function. Until now, it has only been invoked by:\
+    /// 1. `LsmStorageInner::force_freeze_memtable` => simplify the logic
+    /// 2. `MiniLsm::close` => the last placehold memtable shouldn't be recorded in the manifest
     fn freeze_memtable(&self, memtable: Arc<MemTable>) -> Result<()> {
         let mut guard = self.state.write();
         let mut snapshot = guard.as_ref().clone();
         let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
         snapshot.imm_memtables.insert(0, old_memtable.clone());
         *guard = Arc::new(snapshot);
+        drop(guard);
         old_memtable.sync_wal()?;
         Ok(())
     }
@@ -594,11 +598,16 @@ impl LsmStorageInner {
         *guard = Arc::new(snapshot);
         drop(guard);
 
-        self.sync_dir()?;
+        if self.options.enable_wal {
+            std::fs::remove_file(self.path_of_wal(sst_id))?;
+        }
+
         self.manifest
             .as_ref()
             .unwrap()
             .add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
+
+        self.sync_dir()?;
 
         Ok(())
     }
