@@ -30,7 +30,26 @@ where
     B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        Ok(Self { a, b })
+        let mut iter = Self { a, b };
+        iter.skip_b()?;
+        Ok(iter)
+    }
+
+    fn choose_a(&self) -> bool {
+        if !self.a.is_valid() {
+            return false;
+        }
+        if !self.b.is_valid() {
+            return true;
+        }
+        self.a.key() < self.b.key()
+    }
+
+    fn skip_b(&mut self) -> Result<()> {
+        while self.a.is_valid() && self.b.is_valid() && self.a.key() == self.b.key() {
+            self.b.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -42,13 +61,7 @@ where
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        if !self.a.is_valid() {
-            return self.b.key();
-        }
-        if !self.b.is_valid() {
-            return self.a.key();
-        }
-        if self.a.key() <= self.b.key() {
+        if self.choose_a() {
             self.a.key()
         } else {
             self.b.key()
@@ -56,13 +69,7 @@ where
     }
 
     fn value(&self) -> &[u8] {
-        if !self.a.is_valid() {
-            return self.b.value();
-        }
-        if !self.b.is_valid() {
-            return self.a.value();
-        }
-        if self.a.key() <= self.b.key() {
+        if self.choose_a() {
             self.a.value()
         } else {
             self.b.value()
@@ -70,39 +77,68 @@ where
     }
 
     fn is_valid(&self) -> bool {
-        self.a.is_valid() || self.b.is_valid()
+        if self.choose_a() {
+            self.a.is_valid()
+        } else {
+            self.b.is_valid()
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.a.is_valid() {
-            self.b.next()?;
-            return Ok(());
-        }
-        if !self.b.is_valid() {
+        if self.choose_a() {
             self.a.next()?;
-            return Ok(());
+        } else {
+            self.b.next()?;
         }
-
-        debug_assert!(self.a.is_valid() && self.b.is_valid());
-
-        // Why I have to declare the scope explicitly
-        // If I don't do this, Rust's borrow checker will yell at me
-        let cmp = { self.a.key().cmp(&self.b.key()) };
-
-        match cmp {
-            std::cmp::Ordering::Less => self.a.next()?,
-            std::cmp::Ordering::Greater => self.b.next()?,
-            std::cmp::Ordering::Equal => {
-                self.a.next()?;
-                self.b.next()?;
-            }
-        }
-
+        self.skip_b()?;
         Ok(())
     }
 
     /// the sum of `num_active_iterators` of all children iterators
     fn num_active_iterators(&self) -> usize {
         self.a.num_active_iterators() + self.b.num_active_iterators()
+    }
+}
+
+#[cfg(test)]
+mod my_tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::iterators::mock_iterator::*;
+
+    proptest! {
+        #[test]
+        fn test_two_merge_iterator_with_random_data(
+            data1 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
+            data2 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
+        ) {
+            let mut data1: Vec<_> = data1.into_iter()
+                .map(|(k, v)| (key_of(k), value_of(v)))
+                .collect();
+            let mut data2: Vec<_> = data2.into_iter()
+                .map(|(k, v)| (key_of(k), value_of(v)))
+                .collect();
+            data1.sort_unstable();
+            data2.sort_unstable();
+
+            let mut expect_data = BTreeMap::new();
+            expect_data.extend(data2.iter().cloned());
+            expect_data.extend(data1.iter().cloned());
+
+            let a = MockIterator::new(data1);
+            let b = MockIterator::new(data2);
+            let mut iter = TwoMergeIterator::create(a, b).unwrap();
+
+            for (key, value) in expect_data {
+                assert!(iter.is_valid());
+                assert_eq!(key.as_ref(), iter.key().raw_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(iter.key().raw_ref()));
+                assert_eq!(value.as_ref(), iter.value(), "Value Mismatch: {} {}", to_string(&value), to_string(iter.value()));
+                iter.next().unwrap();
+            }
+            assert!(!iter.is_valid());
+        }
     }
 }

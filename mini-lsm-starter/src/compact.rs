@@ -432,7 +432,7 @@ impl LsmStorageInner {
 }
 
 #[cfg(any(debug_assertions, test))]
-fn print_levels_for_debug(snapshot: &LsmStorageState) {
+pub fn print_levels_for_debug(snapshot: &LsmStorageState) {
     let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
     let mut key_ranges: Vec<(String, String)> = Vec::new();
     for sst_id in &snapshot.l0_sstables {

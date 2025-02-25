@@ -34,19 +34,33 @@ pub struct SstConcatIterator {
 }
 
 impl SstConcatIterator {
+    #[cfg(debug_assertions)]
+    #[track_caller]
+    fn check_sst_valid(sstables: &[Arc<SsTable>]) {
+        for sst in sstables {
+            assert!(sst.first_key() < sst.last_key(),);
+        }
+        for win in sstables.windows(2) {
+            assert!(win[0].last_key() < win[1].first_key(),)
+        }
+    }
+
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
+        Self::check_sst_valid(&sstables);
         let mut iter = Self::create(sstables)?;
         iter.seek_to_first()?;
         Ok(iter)
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
+        Self::check_sst_valid(&sstables);
         let mut iter = Self::create(sstables)?;
         iter.seek_to_key(key)?;
         Ok(iter)
     }
 
     fn create(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
+        Self::check_sst_valid(&sstables);
         Ok(Self {
             current: None,
             next_sst_idx: 0,

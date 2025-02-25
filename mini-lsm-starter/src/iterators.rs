@@ -14,6 +14,7 @@
 
 pub mod concat_iterator;
 pub mod merge_iterator;
+mod mock_iterator;
 pub mod two_merge_iterator;
 
 pub trait StorageIterator {

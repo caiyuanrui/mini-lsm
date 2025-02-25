@@ -39,7 +39,7 @@ use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
@@ -619,71 +619,100 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
-        let mut mt_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        mt_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
-        mt_iters.extend(
-            snapshot
-                .imm_memtables
-                .iter()
-                .map(|mt| Box::new(mt.scan(lower, upper))),
-        );
-
-        let key_slice = match lower {
-            Bound::Included(bytes) => KeySlice::from_slice(bytes),
-            Bound::Excluded(bytes) => KeySlice::from_slice(bytes),
-            Bound::Unbounded => KeySlice::default(),
+        let memtable_iter = {
+            let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+            memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
+            memtable_iters.extend(
+                snapshot
+                    .imm_memtables
+                    .iter()
+                    .map(|x| Box::new(x.scan(lower, upper))),
+            );
+            MergeIterator::create(memtable_iters)
         };
 
-        let mut l0_sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
-        for idx in &snapshot.l0_sstables {
-            let sst_table = match snapshot.sstables.get(idx) {
-                // sst_table is bounded and inclusive
-                Some(sst_table)
-                    if range_overlap(
-                        (
-                            sst_table.first_key().raw_ref(),
-                            sst_table.last_key().raw_ref(),
-                        ),
-                        (lower, upper),
-                    ) =>
-                {
-                    sst_table.clone()
-                }
-                _ => continue,
-            };
-            let sst_iter = {
-                let mut sst_iter = SsTableIterator::create_and_seek_to_key(sst_table, key_slice)?;
-                if let Bound::Excluded(key) = lower {
-                    if key == key_slice.raw_ref() {
-                        sst_iter.next()?;
+        let l0_iter = MergeIterator::create(
+            snapshot
+                .l0_sstables
+                .iter()
+                .filter_map(|sst_id| {
+                    let sst = &snapshot.sstables[sst_id];
+                    range_overlap(
+                        lower,
+                        upper,
+                        sst.first_key().raw_ref(),
+                        sst.last_key().raw_ref(),
+                    )
+                    .then_some(sst.clone())
+                })
+                .map(|sst| match lower {
+                    Bound::Included(lower) => {
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(lower))
                     }
-                }
-                if !sst_iter.is_valid() {
-                    continue;
-                }
-                sst_iter
-            };
-            l0_sst_iters.push(Box::new(sst_iter));
-        }
+                    Bound::Excluded(lower) => {
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(lower))
+                            .and_then(|mut iter| {
+                                if iter.is_valid() && iter.key().raw_ref() == lower {
+                                    iter.next()?;
+                                }
+                                Ok(iter)
+                            })
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst),
+                })
+                .map(|x| x.map(Box::new))
+                .collect::<Result<Vec<Box<SsTableIterator>>>>()?,
+        );
 
-        let mut level_iters = Vec::new();
-        for (k, level) in snapshot.levels.iter() {
-            level_iters.push(Box::new(SstConcatIterator::create_and_seek_to_key(
-                level
-                    .iter()
-                    .map(|id| snapshot.sstables[id].clone())
-                    .collect(),
-                key_slice,
-            )?));
-        }
+        let levels_iter = MergeIterator::create(
+            snapshot
+                .levels
+                .iter()
+                .map(|(_, sst_ids)| {
+                    let sstables = sst_ids
+                        .iter()
+                        .filter_map(|sst_id| {
+                            let table = &snapshot.sstables[sst_id];
+                            range_overlap(
+                                lower,
+                                upper,
+                                table.first_key().raw_ref(),
+                                table.last_key().raw_ref(),
+                            )
+                            .then_some(table.clone())
+                        })
+                        .collect();
+                    // expect Option<Result<Iter>>
+                    match lower {
+                        Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(
+                            sstables,
+                            KeySlice::from_slice(key),
+                        ),
+                        Bound::Excluded(key) => SstConcatIterator::create_and_seek_to_key(
+                            sstables,
+                            KeySlice::from_slice(key),
+                        )
+                        .and_then(|mut iter| {
+                            if iter.is_valid() && iter.key().raw_ref() == key {
+                                iter.next()?;
+                            }
+                            Ok(iter)
+                        }),
+                        Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables),
+                    }
+                })
+                .map(|x| x.map(Box::new))
+                .collect::<Result<Vec<_>>>()?,
+        );
 
-        let a = MergeIterator::create(mt_iters);
-        let b = MergeIterator::create(l0_sst_iters);
-        let mem_and_l0_iter = TwoMergeIterator::create(a, b)?;
-        let l1_iter = MergeIterator::create(level_iters);
-        let inner = TwoMergeIterator::create(mem_and_l0_iter, l1_iter)?;
-
-        Ok(FusedIterator::new(LsmIterator::new(inner, upper)?))
+        let inner = TwoMergeIterator::create(
+            TwoMergeIterator::create(memtable_iter, l0_iter)?,
+            levels_iter,
+        )?;
+        Ok(FusedIterator::new(LsmIterator::new(
+            inner,
+            map_bound(upper),
+        )?))
     }
 
     pub fn scan_range(&self, range: impl RangeBounds<[u8]>) -> Result<FusedIterator<LsmIterator>> {
@@ -691,166 +720,45 @@ impl LsmStorageInner {
     }
 }
 
-// r1 is bounded and inclusive
-fn range_overlap<Idx: PartialOrd>(r1: (Idx, Idx), r2: (Bound<Idx>, Bound<Idx>)) -> bool {
-    let (a, b) = r1;
-    let (c, d) = r2;
-    let left_check = match c {
-        Bound::Included(c) => b < c,  // [c, ...
-        Bound::Excluded(c) => b <= c, // (c, ...
-        Bound::Unbounded => false,    // (-∞, ...
+fn range_overlap<Idx: PartialOrd>(
+    user_begin: Bound<Idx>,
+    user_end: Bound<Idx>,
+    table_begin: Idx,
+    table_end: Idx,
+) -> bool {
+    match user_begin {
+        Bound::Included(user_begin) if table_end < user_begin => return false,
+        Bound::Excluded(user_begin) if table_end <= user_begin => return false,
+        _ => (),
     };
-    let right_check = match d {
-        Bound::Included(d) => a > d,  // ..., d]
-        Bound::Excluded(d) => a >= d, // ..., d)
-        Bound::Unbounded => false,    // ..., +∞)
+    match user_end {
+        Bound::Included(user_end) if user_end < table_begin => return false,
+        Bound::Excluded(user_end) if user_end <= table_begin => return false,
+        _ => (),
     };
-    !(left_check || right_check)
+    true
 }
 
 #[cfg(test)]
 mod my_tests {
     use super::*;
-    use std::ops::Bound;
+    use std::ops::Bound::*;
 
     #[test]
-    fn test_range_overlap_deepseek() {
-        // 测试用例 1: r1 和 r2 都是无界的
-        assert!(range_overlap((1, 5), (Bound::Unbounded, Bound::Unbounded)));
+    fn test_range_overlap() {
+        assert!(range_overlap(Unbounded, Unbounded, 10, 20)); // Fully overlapping
+        assert!(range_overlap(Included(5), Included(15), 10, 20)); // Partial overlap
+        assert!(range_overlap(Included(15), Included(25), 10, 20)); // Partial overlap
+        assert!(!range_overlap(Included(21), Included(30), 10, 20)); // Completely disjoint (right)
+        assert!(!range_overlap(Included(1), Included(9), 10, 20)); // Completely disjoint (left)
+        assert!(range_overlap(Included(1), Included(10), 10, 20)); // Edge case
 
-        // 测试用例 2: r2 是无界的下界，有界的上界（包含）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Unbounded, Bound::Included(3))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Unbounded, Bound::Included(0))
-        ));
+        assert!(range_overlap(Excluded(10), Included(20), 10, 20)); // Touching boundary (left)
+        assert!(range_overlap(Included(10), Excluded(20), 10, 20)); // Touching boundary (right)
+        assert!(!range_overlap(Excluded(20), Unbounded, 10, 20)); // Right boundary disjoint
 
-        // 测试用例 3: r2 是无界的下界，有界的上界（排除）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Unbounded, Bound::Excluded(3))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Unbounded, Bound::Excluded(1))
-        ));
-
-        // 测试用例 4: r2 是有界的下界（包含），无界的上界
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Included(3), Bound::Unbounded)
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Included(6), Bound::Unbounded)
-        ));
-
-        // 测试用例 5: r2 是有界的下界（排除），无界的上界
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Excluded(3), Bound::Unbounded)
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Excluded(5), Bound::Unbounded)
-        ));
-
-        // 测试用例 6: r2 是有界的下界（包含）和上界（包含）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Included(3), Bound::Included(4))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Included(6), Bound::Included(7))
-        ));
-
-        // 测试用例 7: r2 是有界的下界（排除）和上界（包含）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Excluded(0), Bound::Included(3))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Excluded(5), Bound::Included(6))
-        ));
-
-        // 测试用例 8: r2 是有界的下界（包含）和上界（排除）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Included(3), Bound::Excluded(6))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Included(6), Bound::Excluded(7))
-        ));
-
-        // 测试用例 9: r2 是有界的下界（排除）和上界（排除）
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Excluded(0), Bound::Excluded(6))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Excluded(5), Bound::Excluded(6))
-        ));
-
-        // 测试用例 10: r1 和 r2 完全不重叠
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Included(6), Bound::Included(7))
-        ));
-        assert!(!range_overlap(
-            (1, 5),
-            (Bound::Excluded(5), Bound::Excluded(6))
-        ));
-
-        // 测试用例 11: r1 和 r2 完全重叠
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Included(1), Bound::Included(5))
-        ));
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Excluded(0), Bound::Excluded(6))
-        ));
-
-        // 测试用例 12: r1 和 r2 部分重叠
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Included(3), Bound::Included(7))
-        ));
-        assert!(range_overlap(
-            (1, 5),
-            (Bound::Excluded(0), Bound::Excluded(3))
-        ));
-    }
-
-    #[test]
-    fn test_range_overlap_chatgpt() {
-        use std::ops::Bound::*;
-
-        // Overlapping cases
-        assert!(range_overlap((5, 10), (Unbounded, Unbounded))); // Unbounded range always overlaps
-        assert!(range_overlap((5, 10), (Unbounded, Included(8)))); // Partially overlaps
-        assert!(range_overlap((5, 10), (Included(7), Unbounded))); // Partially overlaps
-        assert!(range_overlap((5, 10), (Included(6), Included(9)))); // Fully inside
-        assert!(range_overlap((5, 10), (Included(10), Included(15)))); // Overlaps at boundary
-        assert!(range_overlap((5, 10), (Excluded(4), Included(6)))); // Overlaps
-        assert!(range_overlap((5, 10), (Excluded(9), Included(12)))); // Overlaps at 10
-
-        // Non-overlapping cases
-        assert!(!range_overlap((5, 10), (Included(11), Included(15)))); // Fully after
-        assert!(!range_overlap((5, 10), (Included(1), Included(4)))); // Fully before
-        assert!(!range_overlap((5, 10), (Excluded(10), Included(15)))); // Touching but not overlapping
-        assert!(!range_overlap((5, 10), (Excluded(4), Excluded(5)))); // Touching but not overlapping
-
-        // Edge cases
-        assert!(range_overlap((5, 10), (Included(5), Included(5)))); // Single element overlap
-        assert!(!range_overlap((5, 10), (Excluded(10), Excluded(11)))); // Touching at exclusive boundary
-        assert!(range_overlap((5, 10), (Included(10), Excluded(11)))); // Touching at inclusive boundary
+        assert!(range_overlap(Included(10), Included(10), 10, 20)); // Single-point overlap
+        assert!(range_overlap(Excluded(10), Excluded(11), 10, 20)); // Small range inside
+        assert!(!range_overlap(Excluded(9), Excluded(10), 10, 20)); // Right before table range
     }
 }
