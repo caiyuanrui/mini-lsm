@@ -29,12 +29,13 @@ pub struct Wal {
 
 impl Wal {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let display_path = format!("{}", path.as_ref().display());
         File::create_new(path)
             .map(BufWriter::new)
             .map(Mutex::new)
             .map(Arc::new)
             .map(|file| Self { file })
-            .context("failed to create wal file")
+            .with_context(|| format!("failed to create wal file {display_path}"))
     }
 
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
@@ -42,7 +43,7 @@ impl Wal {
             .read(true)
             .append(true)
             .open(&path)
-            .context("failed to open wal file")?;
+            .with_context(|| format!("failed to open wal file {}", path.as_ref().display()))?;
         let mut reader = BufReader::new(&file);
         let (mut bytes_read, file_len) = (0, file.metadata()?.len());
         while bytes_read < file_len {

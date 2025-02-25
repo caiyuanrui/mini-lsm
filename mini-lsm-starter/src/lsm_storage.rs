@@ -203,21 +203,24 @@ impl MiniLsm {
                 .map_err(|e| anyhow!("compaction thread panics: {e:?}"))?;
         }
 
+        // =============== WAL is enabled ===============
         if self.inner.options.enable_wal {
+            // self.persist_memtables_with_wal()
+            self.inner.sync()?;
+            self.inner.sync_dir()?;
             return Ok(());
         }
-
+        // =============== WAL is disabled ===============
         if !self.inner.state.read().memtable.is_empty() {
             // don't record the empty memtable's id in the manifest
+            // let _state_lock = self.inner.state_lock.lock(); // is it necessary to acquire this lock here?
             self.inner
                 .freeze_memtable(Arc::new(MemTable::create(self.inner.next_sst_id())))?;
         }
-
         while !self.inner.state.read().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
         }
         self.inner.sync_dir()?;
-
         Ok(())
     }
 
@@ -329,7 +332,13 @@ impl LsmStorageInner {
         let manifest_path = path.join("MANIFEST");
         let manifest;
         if !manifest_path.exists() {
-            manifest = Manifest::create(manifest_path)?;
+            if options.enable_wal {
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    state.memtable.id(),
+                    Self::path_of_wal_static(path, state.memtable.id()),
+                )?);
+            }
+            manifest = Manifest::create(manifest_path).context("failed to create manifest")?;
             manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
         } else {
             let (m, records) = Manifest::recover(manifest_path)?;
@@ -362,6 +371,25 @@ impl LsmStorageInner {
                     }
                 }
             }
+            // recover MemTables
+            if !memtables.is_empty() && options.enable_wal {
+                let memtable_id = memtables.pop_last().unwrap();
+                state.memtable = Arc::new(MemTable::recover_from_wal(
+                    memtable_id,
+                    Self::path_of_wal_static(path, memtable_id),
+                )?);
+                for imm_memtable_id in memtables.into_iter().rev() {
+                    state.imm_memtables.push(Arc::new(
+                        MemTable::recover_from_wal(
+                            imm_memtable_id,
+                            Self::path_of_wal_static(path, imm_memtable_id),
+                        )
+                        .with_context(|| {
+                            format!("failed to recover imm_memtable from {imm_memtable_id}.wal")
+                        })?,
+                    ));
+                }
+            }
             // recover SSTs
             let sst_cnt = AtomicUsize::new(0);
             let results: Result<Vec<_>> = state
@@ -382,7 +410,7 @@ impl LsmStorageInner {
             for (sst_id, sst) in results? {
                 state.sstables.insert(sst_id, sst);
             }
-            println!(
+            log::debug!(
                 "{} SSTs opened",
                 sst_cnt.load(std::sync::atomic::Ordering::Relaxed)
             );
@@ -581,25 +609,27 @@ impl LsmStorageInner {
             self.path_of_sst(sst_id),
         )?);
 
-        let log_first_key = sst.first_key().raw_ref().to_vec();
-        let log_last_key = sst.last_key().raw_ref().to_vec();
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
 
-        let mut guard = self.state.write();
-        let mut snapshot = guard.as_ref().clone();
-
-        snapshot.imm_memtables.retain(|x| x.id() != sst_id);
-        snapshot.sstables.insert(sst_id, sst);
-        if self.compaction_controller.flush_to_l0() {
-            snapshot.l0_sstables.insert(0, sst_id);
-        } else {
-            snapshot.levels.insert(0, (sst_id, vec![sst_id]));
+            snapshot.imm_memtables.retain(|x| x.id() != sst_id);
+            snapshot.sstables.insert(sst_id, sst);
+            if self.compaction_controller.flush_to_l0() {
+                snapshot.l0_sstables.insert(0, sst_id);
+            } else {
+                snapshot.levels.insert(0, (sst_id, vec![sst_id]));
+            }
+            log::debug!(
+                "flushed {}.sst with size={}",
+                memtable_to_flush.id(),
+                memtable_to_flush.approximate_size()
+            );
+            *guard = Arc::new(snapshot);
         }
 
-        *guard = Arc::new(snapshot);
-        drop(guard);
-
         if self.options.enable_wal {
-            std::fs::remove_file(self.path_of_wal(sst_id))?;
+            std::fs::remove_file(self.path_of_wal(sst_id)).context("failed to remove wal file")?;
         }
 
         self.manifest

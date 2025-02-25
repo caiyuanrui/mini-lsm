@@ -38,7 +38,7 @@ impl SstConcatIterator {
     #[track_caller]
     fn check_sst_valid(sstables: &[Arc<SsTable>]) {
         for sst in sstables {
-            assert!(sst.first_key() < sst.last_key(),);
+            assert!(sst.first_key() <= sst.last_key(),);
         }
         for win in sstables.windows(2) {
             assert!(win[0].last_key() < win[1].first_key(),)

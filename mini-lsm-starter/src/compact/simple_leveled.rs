@@ -55,11 +55,11 @@ impl SimpleLeveledCompactionController {
 
         // merge l0 with l1
         if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
-            // println!(
-            //     "compaction triggered at level 0 because L0 has {} SSTs >= {}",
-            //     snapshot.l0_sstables.len(),
-            //     self.options.level0_file_num_compaction_trigger
-            // );
+            log::debug!(
+                "compaction triggered at level 0 because L0 has {} SSTs >= {}",
+                snapshot.l0_sstables.len(),
+                self.options.level0_file_num_compaction_trigger
+            );
             return Some(SimpleLeveledCompactionTask {
                 upper_level: None,
                 upper_level_sst_ids: snapshot.l0_sstables.clone(),
