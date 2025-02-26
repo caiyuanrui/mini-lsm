@@ -70,9 +70,10 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: impl Buf) -> Result<Vec<BlockMeta>> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32();
+        let checksum = crc32fast::hash(&buf.chunk()[..buf.remaining() - size_of::<u32>()]);
         for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16();
@@ -83,9 +84,12 @@ impl BlockMeta {
                 offset,
                 first_key,
                 last_key,
-            });
+            })
         }
-        block_meta
+        if checksum != buf.get_u32() {
+            bail!("block meta checksum mismatch")
+        }
+        Ok(block_meta)
     }
 }
 
@@ -171,7 +175,7 @@ impl SsTable {
             .get_u32() as usize;
         let block_meta = BlockMeta::decode_block_meta(
             &bytes[block_meta_offset..bloom_offset - BLOCK_META_OFFSET_SIZE],
-        );
+        )?;
 
         let first_key = block_meta
             .first()
@@ -324,7 +328,7 @@ mod my_tests {
 
         let mut buf = Vec::new();
         BlockMeta::encode_block_meta(block_meta.as_ref(), &mut buf);
-        let decoded = BlockMeta::decode_block_meta(buf.as_ref());
+        let decoded = BlockMeta::decode_block_meta(buf.as_ref()).unwrap();
 
         assert_eq!(block_meta, decoded);
     }
