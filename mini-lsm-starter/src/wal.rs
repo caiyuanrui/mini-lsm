@@ -13,13 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufWriter, Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
 
-use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
+use anyhow::{bail, Context, Result};
+use bytes::{Buf, Bytes};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
@@ -39,31 +39,30 @@ impl Wal {
     }
 
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open wal file {}", path.as_ref().display()))?;
-        let mut reader = BufReader::new(&file);
-        let (mut bytes_read, file_len) = (0, file.metadata()?.len());
-        while bytes_read < file_len {
-            let mut key_len = [0; size_of::<u32>()];
-            reader.read_exact(&mut key_len)?;
-            let key_len = u32::from_be_bytes(key_len);
-            let mut key = BytesMut::zeroed(key_len as usize);
-            reader.read_exact(&mut key)?;
-            let mut value_len = [0; size_of::<u32>()];
-            reader.read_exact(&mut value_len)?;
-            let value_len = u32::from_be_bytes(value_len);
-            let mut value = BytesMut::zeroed(value_len as usize);
-            reader.read_exact(&mut value)?;
-            skiplist.insert(key.freeze(), value.freeze());
-            bytes_read += 2 * size_of::<u32>() as u64 + key_len as u64 + value_len as u64;
+        let mut buf = Vec::with_capacity(file.metadata()?.len() as usize);
+        file.read_to_end(&mut buf)?;
+        let mut cursor = Cursor::new(buf);
+        while cursor.has_remaining() {
+            let key_len = cursor.get_u32();
+            let key = cursor.copy_to_bytes(key_len as usize);
+            let value_len = cursor.get_u32();
+            let value = cursor.copy_to_bytes(value_len as usize);
+            let checksum = cursor.get_u32();
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&key_len.to_be_bytes());
+            hasher.update(&key);
+            hasher.update(&value_len.to_be_bytes());
+            hasher.update(&value);
+            if checksum != hasher.finalize() {
+                bail!("wal checksum mismatch")
+            }
+            skiplist.insert(key, value);
         }
-        assert_eq!(
-            bytes_read, file_len,
-            "don't manipulate lsm engine when wal recovery is running on"
-        );
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
         })
@@ -71,13 +70,19 @@ impl Wal {
 
     /// Note that data is persisted only when `sync` is called.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // | key_len | key | value_len | value |
+        // | key_len | key | value_len | value | checksum |
         let mut file = self.file.lock();
         let (key_len, value_len) = (key.len() as u32, value.len() as u32);
         file.write_all(&key_len.to_be_bytes())?;
         file.write_all(key)?;
         file.write_all(&value_len.to_be_bytes())?;
         file.write_all(value)?;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&key_len.to_be_bytes());
+        hasher.update(key);
+        hasher.update(&value_len.to_be_bytes());
+        hasher.update(value);
+        file.write_all(&hasher.finalize().to_be_bytes())?;
         Ok(())
     }
 
