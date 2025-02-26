@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use std::fs::OpenOptions;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use bytes::{Buf, BufMut};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -49,15 +51,23 @@ impl Manifest {
     }
 
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .open(path)
             .context("failed to recover manifest file")?;
-        let reader = std::io::BufReader::new(file.try_clone()?);
         let mut records = Vec::new();
-        for value in serde_json::Deserializer::from_reader(reader).into_iter() {
-            records.push(value?);
+        let mut buf = Vec::with_capacity(file.metadata()?.len() as usize);
+        file.read_to_end(&mut buf)?;
+        let mut cursor = Cursor::new(buf);
+        while cursor.has_remaining() {
+            let len = cursor.get_u32();
+            let json_bytes = cursor.copy_to_bytes(len as usize);
+            let checksum = cursor.get_u32();
+            if crc32fast::hash(&json_bytes) != checksum {
+                bail!("manifest checksum mismatch")
+            }
+            records.push(serde_json::from_slice(&json_bytes)?);
         }
 
         Ok((
@@ -77,7 +87,12 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
-        let buf = serde_json::to_vec(&record)?;
+        let json = serde_json::to_vec(&record)?;
+        let mut buf = Vec::with_capacity(json.len() + 2 * size_of::<u32>());
+        buf.put_u32(json.len() as u32);
+        buf.put_slice(&json);
+        buf.put_u32(crc32fast::hash(&json));
+
         let mut file = self.file.lock();
         file.write_all(&buf)?;
         file.sync_all()?;
