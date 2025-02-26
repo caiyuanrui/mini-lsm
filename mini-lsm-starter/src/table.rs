@@ -25,7 +25,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -242,7 +242,13 @@ impl SsTable {
         let mut buf = vec![0; length];
         file.read_exact_at(&mut buf, offset as u64)?;
 
-        Ok(Arc::new(Block::decode(buf.as_ref())))
+        let (block, mut checksum) = buf.split_at(length - size_of::<u32>());
+        let checksum = checksum.get_u32();
+        if crc32fast::hash(block) != checksum {
+            bail!("block checksum failed")
+        }
+
+        Ok(Arc::new(Block::decode(block)))
     }
 
     /// Read a block from disk, with block cache. (Day 4)

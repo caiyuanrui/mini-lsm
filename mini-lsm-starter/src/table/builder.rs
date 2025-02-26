@@ -86,7 +86,10 @@ impl SsTableBuilder {
             last_key,
         };
 
-        self.data.put_slice(block.encode().as_ref());
+        let block = block.encode();
+        let checksum = crc32fast::hash(&block);
+        self.data.put_slice(block.as_ref());
+        self.data.put_u32(checksum);
         self.meta.push(meta);
     }
 
