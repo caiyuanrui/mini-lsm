@@ -20,18 +20,16 @@ use bytes::BufMut;
 
 use super::{bloom::Bloom, BlockMeta, FileObject, SsTable};
 use crate::{
-    block::{BlockBuilder, BlockIterator},
-    key::KeySlice,
+    block::BlockBuilder,
+    key::{KeySlice, KeyVec},
     lsm_storage::BlockCache,
 };
-
-const SST_SIZE: usize = 512 * 1024 * 1024;
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -43,9 +41,9 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
-            data: Vec::with_capacity(SST_SIZE),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
+            data: Vec::with_capacity(1 << 25),
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
@@ -57,11 +55,21 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        if self.first_key.is_empty() {
+            self.first_key.set_from_slice(key);
+        }
+
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
-        while !self.builder.add(key, value) {
-            self.freeze_block_builder();
+        if self.builder.add(key, value) {
+            self.last_key.set_from_slice(key);
+            return;
         }
+        self.freeze_block_builder();
+
+        assert!(self.builder.add(key, value));
+        self.first_key.set_from_slice(key);
+        self.last_key.set_from_slice(key);
     }
 
     /// Build block_builder and append the generated block and metadata to the vector.
@@ -75,22 +83,16 @@ impl SsTableBuilder {
             std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let block = Arc::new(block_builder.build());
 
-        let mut iter = BlockIterator::create_and_seek_to_first(block.clone());
-        let first_key = iter.key().to_key_vec().into_key_bytes();
-        iter.seek_to_last();
-        let last_key = iter.key().to_key_vec().into_key_bytes();
-
-        let meta = BlockMeta {
+        self.meta.push(BlockMeta {
             offset: self.data.len(),
-            first_key,
-            last_key,
-        };
+            first_key: std::mem::take(&mut self.first_key).into_key_bytes(),
+            last_key: std::mem::take(&mut self.last_key).into_key_bytes(),
+        });
 
         let block = block.encode();
         let checksum = crc32fast::hash(&block);
         self.data.put_slice(block.as_ref());
         self.data.put_u32(checksum);
-        self.meta.push(meta);
     }
 
     /// Get the estimated size of the SSTable.

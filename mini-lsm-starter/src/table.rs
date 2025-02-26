@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
@@ -50,36 +47,38 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
-        for block_meta in block_meta {
-            buf.put_u32(block_meta.offset as u32);
-            buf.put_u16(block_meta.first_key.len() as u16);
-            buf.put_slice(block_meta.first_key.raw_ref());
-            buf.put_u16(block_meta.last_key.len() as u16);
-            buf.put_slice(block_meta.last_key.raw_ref());
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+        let additional = block_meta
+            .iter()
+            .map(|meta| {
+                meta.first_key.len() + meta.last_key.len() + size_of::<u32>() + 2 * size_of::<u16>()
+            })
+            .sum::<usize>()
+            + size_of::<u32>();
+        buf.reserve(additional);
+        let original_len = buf.len();
+        // | no. of blocks | meta data | checksum |
+        buf.put_u32(block_meta.len() as u32);
+        for meta in block_meta {
+            buf.put_u32(meta.offset as u32);
+            buf.put_u16(meta.first_key.len() as u16);
+            buf.put_slice(meta.first_key.raw_ref());
+            buf.put_u16(meta.last_key.len() as u16);
+            buf.put_slice(meta.last_key.raw_ref());
         }
+        buf.put_u32(crc32fast::hash(&buf[original_len + 4..]));
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
         let mut block_meta = Vec::new();
-        while buf.has_remaining() {
+        let num = buf.get_u32();
+        for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16();
-            let first_key = KeyBytes::from_bytes(bytes::Bytes::copy_from_slice(
-                buf.chunk()[..first_key_len as usize].as_ref(),
-            ));
-            buf.advance(first_key_len as usize);
+            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len as usize));
             let last_key_len = buf.get_u16();
-            let last_key = KeyBytes::from_bytes(bytes::Bytes::copy_from_slice(
-                buf.chunk()[..last_key_len as usize].as_ref(),
-            ));
-            buf.advance(last_key_len as usize);
-
+            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_key_len as usize));
             block_meta.push(BlockMeta {
                 offset,
                 first_key,
