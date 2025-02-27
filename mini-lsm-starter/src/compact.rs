@@ -431,52 +431,52 @@ impl LsmStorageInner {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
-pub fn print_levels_for_debug(snapshot: &LsmStorageState) {
-    let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
-    let mut key_ranges: Vec<(String, String)> = Vec::new();
-    for sst_id in &snapshot.l0_sstables {
-        let sst = &snapshot.sstables[sst_id];
-        let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
-        let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
-        key_ranges.push((key, value));
-    }
-    levels.push((0, key_ranges));
+// #[cfg(any(debug_assertions, test))]
+// pub fn print_levels_for_debug(snapshot: &LsmStorageState) {
+//     let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+//     let mut key_ranges: Vec<(String, String)> = Vec::new();
+//     for sst_id in &snapshot.l0_sstables {
+//         let sst = &snapshot.sstables[sst_id];
+//         let key = String::from_utf8(sst.first_key().key_ref().to_vec()).unwrap();
+//         let value = String::from_utf8(sst.last_key().key_ref().to_vec()).unwrap();
+//         key_ranges.push((key, value));
+//     }
+//     levels.push((0, key_ranges));
 
-    for (level, sst_ids) in &snapshot.levels {
-        let mut key_ranges: Vec<(String, String)> = Vec::new();
-        for sst_id in sst_ids {
-            let sst = &snapshot.sstables[sst_id];
-            let key = String::from_utf8(sst.first_key().raw_ref().to_vec()).unwrap();
-            let value = String::from_utf8(sst.last_key().raw_ref().to_vec()).unwrap();
-            key_ranges.push((key, value));
-        }
-        levels.push((*level, key_ranges));
-    }
+//     for (level, sst_ids) in &snapshot.levels {
+//         let mut key_ranges: Vec<(String, String)> = Vec::new();
+//         for sst_id in sst_ids {
+//             let sst = &snapshot.sstables[sst_id];
+//             let key = String::from_utf8(sst.first_key().key_ref().to_vec()).unwrap();
+//             let value = String::from_utf8(sst.last_key().key_ref().to_vec()).unwrap();
+//             key_ranges.push((key, value));
+//         }
+//         levels.push((*level, key_ranges));
+//     }
 
-    for (level, key_ranges) in levels {
-        log::debug!("========== L{level} ==========");
-        for (k1, k2) in key_ranges {
-            log::debug!("{k1} {k2}");
-        }
-    }
-}
+//     for (level, key_ranges) in levels {
+//         log::debug!("========== L{level} ==========");
+//         for (k1, k2) in key_ranges {
+//             log::debug!("{k1} {k2}");
+//         }
+//     }
+// }
 
-#[cfg(any(debug_assertions, test))]
-fn get_first_last_key_from_iter_for_debug(
-    mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
-) -> (String, String) {
-    let mut first_key = Vec::new();
-    let mut last_key = Vec::new();
-    while iter.is_valid() {
-        last_key = iter.key().raw_ref().to_vec();
-        if first_key.is_empty() {
-            first_key = iter.key().raw_ref().to_vec();
-        }
-        iter.next().unwrap();
-    }
-    (
-        String::from_utf8(first_key).unwrap(),
-        String::from_utf8(last_key).unwrap(),
-    )
-}
+// #[cfg(any(debug_assertions, test))]
+// fn get_first_last_key_from_iter_for_debug(
+//     mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+// ) -> (String, String) {
+//     let mut first_key = Vec::new();
+//     let mut last_key = Vec::new();
+//     while iter.is_valid() {
+//         last_key = iter.key().key_ref().to_vec();
+//         if first_key.is_empty() {
+//             first_key = iter.key().key_ref().to_vec();
+//         }
+//         iter.next().unwrap();
+//     }
+//     (
+//         String::from_utf8(first_key).unwrap(),
+//         String::from_utf8(last_key).unwrap(),
+//     )
+// }

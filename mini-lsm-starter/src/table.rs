@@ -64,10 +64,10 @@ impl BlockMeta {
         buf.put_u32(block_meta.len() as u32);
         for meta in block_meta {
             buf.put_u32(meta.offset as u32);
-            buf.put_u16(meta.first_key.raw_len() as u16);
+            buf.put_u16(meta.first_key.key_len() as u16);
             buf.put_slice(meta.first_key.key_ref());
             buf.put_u64(meta.first_key.ts());
-            buf.put_u16(meta.last_key.raw_len() as u16);
+            buf.put_u16(meta.last_key.key_len() as u16);
             buf.put_slice(meta.last_key.key_ref());
             buf.put_u64(meta.last_key.ts());
         }
@@ -75,10 +75,10 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Result<Vec<BlockMeta>> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> Result<Vec<BlockMeta>> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32();
-        let checksum = crc32fast::hash(&buf.chunk()[..buf.remaining() - size_of::<u32>()]);
+        let checksum = crc32fast::hash(&buf[..buf.remaining() - size_of::<u32>()]);
         for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16();

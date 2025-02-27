@@ -36,7 +36,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_RANGE_BEGIN};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
@@ -454,7 +454,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let key_slice = KeySlice::from_slice(key);
+        let key_slice = KeySlice::from_slice(key, TS_RANGE_BEGIN);
         let snapshot = {
             let state = self.state.read();
             Arc::clone(&state)
@@ -477,9 +477,9 @@ impl LsmStorageInner {
             };
             let iter = SsTableIterator::create_and_seek_to_key(
                 sst_table.clone(),
-                KeySlice::from_slice(key),
+                KeySlice::from_slice(key, TS_RANGE_BEGIN),
             )?;
-            if iter.is_valid() && iter.key().raw_ref() == key {
+            if iter.is_valid() && iter.key().key_ref() == key {
                 if iter.value() == b"" {
                     return Ok(None);
                 }
@@ -493,7 +493,7 @@ impl LsmStorageInner {
                 .map(|id| snapshot.sstables[id].clone())
                 .collect();
             let concat_iter = SstConcatIterator::create_and_seek_to_key(sstables, key_slice)?;
-            if concat_iter.is_valid() && concat_iter.key().raw_ref() == key {
+            if concat_iter.is_valid() && concat_iter.key().key_ref() == key {
                 if concat_iter.value() == b"" {
                     return Ok(None);
                 }
@@ -691,24 +691,26 @@ impl LsmStorageInner {
                     range_overlap(
                         lower,
                         upper,
-                        sst.first_key().raw_ref(),
-                        sst.last_key().raw_ref(),
+                        sst.first_key().key_ref(),
+                        sst.last_key().key_ref(),
                     )
                     .then_some(sst.clone())
                 })
                 .map(|sst| match lower {
-                    Bound::Included(lower) => {
-                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(lower))
-                    }
-                    Bound::Excluded(lower) => {
-                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(lower))
-                            .and_then(|mut iter| {
-                                if iter.is_valid() && iter.key().raw_ref() == lower {
-                                    iter.next()?;
-                                }
-                                Ok(iter)
-                            })
-                    }
+                    Bound::Included(lower) => SsTableIterator::create_and_seek_to_key(
+                        sst,
+                        KeySlice::from_slice(lower, TS_RANGE_BEGIN),
+                    ),
+                    Bound::Excluded(lower) => SsTableIterator::create_and_seek_to_key(
+                        sst,
+                        KeySlice::from_slice(lower, TS_RANGE_BEGIN),
+                    )
+                    .and_then(|mut iter| {
+                        if iter.is_valid() && iter.key().key_ref() == lower {
+                            iter.next()?;
+                        }
+                        Ok(iter)
+                    }),
                     Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst),
                 })
                 .map(|x| x.map(Box::new))
@@ -727,8 +729,8 @@ impl LsmStorageInner {
                             range_overlap(
                                 lower,
                                 upper,
-                                table.first_key().raw_ref(),
-                                table.last_key().raw_ref(),
+                                table.first_key().key_ref(),
+                                table.last_key().key_ref(),
                             )
                             .then_some(table.clone())
                         })
@@ -737,14 +739,14 @@ impl LsmStorageInner {
                     match lower {
                         Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(
                             sstables,
-                            KeySlice::from_slice(key),
+                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
                         ),
                         Bound::Excluded(key) => SstConcatIterator::create_and_seek_to_key(
                             sstables,
-                            KeySlice::from_slice(key),
+                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
                         )
                         .and_then(|mut iter| {
-                            if iter.is_valid() && iter.key().raw_ref() == key {
+                            if iter.is_valid() && iter.key().key_ref() == key {
                                 iter.next()?;
                             }
                             Ok(iter)

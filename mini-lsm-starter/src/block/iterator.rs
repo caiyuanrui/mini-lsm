@@ -106,6 +106,7 @@ impl BlockIterator {
         let num_of_elements = self.block.offsets.len();
         if index >= num_of_elements {
             self.key.clear();
+            self.value_range = (0, 0);
             return;
         }
 
@@ -113,18 +114,18 @@ impl BlockIterator {
         let mut cursor = Cursor::new(&self.block.data[offset..]);
 
         let overlap_key_len = cursor.get_u16();
-        let overlap_key = &self.first_key.key_ref()[..overlap_key_len as usize];
         let rest_key_len = cursor.get_u16();
-        let mut key = Vec::with_capacity(overlap_key_len as usize + rest_key_len as usize);
-        key.extend_from_slice(overlap_key);
-        cursor.copy_to_slice(&mut key[overlap_key_len as usize..]);
+        self.key.clear();
+        self.key
+            .append(&self.first_key.key_ref()[..overlap_key_len as usize]);
+        self.key.append(&cursor.chunk()[..rest_key_len as usize]);
+        cursor.advance(rest_key_len as usize);
         let ts = cursor.get_u64();
-        let key = KeyVec::from_vec_with_ts(key, ts);
+        self.key.set_ts(ts);
 
         let value_len = cursor.get_u16();
         let value_offset = offset + cursor.position() as usize;
         self.idx = index;
-        self.key = key;
         self.value_range = (value_offset, value_offset + value_len as usize);
     }
 

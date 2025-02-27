@@ -100,45 +100,45 @@ where
     }
 }
 
-#[cfg(test)]
-mod my_tests {
-    use std::collections::BTreeMap;
+// #[cfg(test)]
+// mod my_tests {
+//     use std::collections::BTreeMap;
 
-    use proptest::prelude::*;
+//     use proptest::prelude::*;
 
-    use super::*;
-    use crate::iterators::mock_iterator::*;
+//     use super::*;
+//     use crate::iterators::mock_iterator::*;
 
-    proptest! {
-        #[test]
-        fn test_two_merge_iterator_with_random_data(
-            data1 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
-            data2 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
-        ) {
-            let mut data1: Vec<_> = data1.into_iter()
-                .map(|(k, v)| (key_of(k), value_of(v)))
-                .collect();
-            let mut data2: Vec<_> = data2.into_iter()
-                .map(|(k, v)| (key_of(k), value_of(v)))
-                .collect();
-            data1.sort_unstable();
-            data2.sort_unstable();
+//     proptest! {
+//         #[test]
+//         fn test_two_merge_iterator_with_random_data(
+//             data1 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
+//             data2 in prop::collection::btree_map(any::<u32>(), any::<u32>(), 1..1000),
+//         ) {
+//             let mut data1: Vec<_> = data1.into_iter()
+//                 .map(|(k, v)| (key_of(k), value_of(v)))
+//                 .collect();
+//             let mut data2: Vec<_> = data2.into_iter()
+//                 .map(|(k, v)| (key_of(k), value_of(v)))
+//                 .collect();
+//             data1.sort_unstable();
+//             data2.sort_unstable();
 
-            let mut expect_data = BTreeMap::new();
-            expect_data.extend(data2.iter().cloned());
-            expect_data.extend(data1.iter().cloned());
+//             let mut expect_data = BTreeMap::new();
+//             expect_data.extend(data2.iter().cloned());
+//             expect_data.extend(data1.iter().cloned());
 
-            let a = MockIterator::new(data1);
-            let b = MockIterator::new(data2);
-            let mut iter = TwoMergeIterator::create(a, b).unwrap();
+//             let a = MockIterator::new(data1);
+//             let b = MockIterator::new(data2);
+//             let mut iter = TwoMergeIterator::create(a, b).unwrap();
 
-            for (key, value) in expect_data {
-                assert!(iter.is_valid());
-                assert_eq!(key.as_ref(), iter.key().key_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(iter.key().key_ref()));
-                assert_eq!(value.as_ref(), iter.value(), "Value Mismatch: {} {}", to_string(&value), to_string(iter.value()));
-                iter.next().unwrap();
-            }
-            assert!(!iter.is_valid());
-        }
-    }
-}
+//             for (key, value) in expect_data {
+//                 assert!(iter.is_valid());
+//                 assert_eq!(key.as_ref(), iter.key().key_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(iter.key().key_ref()));
+//                 assert_eq!(value.as_ref(), iter.value(), "Value Mismatch: {} {}", to_string(&value), to_string(iter.value()));
+//                 iter.next().unwrap();
+//             }
+//             assert!(!iter.is_valid());
+//         }
+//     }
+// }

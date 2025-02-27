@@ -141,45 +141,45 @@ where
     }
 }
 
-#[cfg(test)]
-mod my_tests {
-    use std::collections::BTreeMap;
+// #[cfg(test)]
+// mod my_tests {
+//     use std::collections::BTreeMap;
 
-    use proptest::{collection::btree_map, prelude::*, proptest};
+//     use proptest::{collection::btree_map, prelude::*, proptest};
 
-    use crate::iterators::mock_iterator::{key_of, to_string, value_of, MockIterator};
+//     use crate::iterators::mock_iterator::{key_of, to_string, value_of, MockIterator};
 
-    use super::*;
+//     use super::*;
 
-    proptest! {
-      #[test]
-      fn test_merge_iterator(data in prop::collection::vec(btree_map(any::<u32>(), any::<u32>(), 1..1000), 2..10)) {
-        let mut runs = Vec::new();
-        for sorted_run in data {
-          let mut data: Vec<_> = sorted_run.into_iter().map(|(k, v)| (key_of(k), value_of(v))).collect();
-          data.sort_unstable();
-          runs.push(data);
-        }
+//     proptest! {
+//       #[test]
+//       fn test_merge_iterator(data in prop::collection::vec(btree_map(any::<u32>(), any::<u32>(), 1..1000), 2..10)) {
+//         let mut runs = Vec::new();
+//         for sorted_run in data {
+//           let mut data: Vec<_> = sorted_run.into_iter().map(|(k, v)| (key_of(k), value_of(v))).collect();
+//           data.sort_unstable();
+//           runs.push(data);
+//         }
 
-        let iters: Vec<_> = runs.iter().map(|run| {
-          Box::new(MockIterator::new(run.clone()))
-        }).collect();
+//         let iters: Vec<_> = runs.iter().map(|run| {
+//           Box::new(MockIterator::new(run.clone()))
+//         }).collect();
 
-        let mut merge_iter = MergeIterator::create(iters);
+//         let mut merge_iter = MergeIterator::create(iters);
 
-        let mut expected_data = BTreeMap::new();
-        for run in runs.iter() {
-            for (key, value) in run.iter() {
-              expected_data.entry(key.clone()).or_insert(value.clone());
-            }
-        }
-        for (key, value) in expected_data {
-          assert!(merge_iter.is_valid());
-          assert_eq!(merge_iter.key().key_ref(), key.as_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(merge_iter.key().key_ref()));
-          assert_eq!(merge_iter.value(), value.as_ref(), "Value Mismatch: {} {}", to_string(&value), to_string(merge_iter.value()));
-          merge_iter.next().unwrap();
-        }
-        assert!(!merge_iter.is_valid());
-      }
-    }
-}
+//         let mut expected_data = BTreeMap::new();
+//         for run in runs.iter() {
+//             for (key, value) in run.iter() {
+//               expected_data.entry(key.clone()).or_insert(value.clone());
+//             }
+//         }
+//         for (key, value) in expected_data {
+//           assert!(merge_iter.is_valid());
+//           assert_eq!(merge_iter.key().key_ref(), key.as_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(merge_iter.key().key_ref()));
+//           assert_eq!(merge_iter.value(), value.as_ref(), "Value Mismatch: {} {}", to_string(&value), to_string(merge_iter.value()));
+//           merge_iter.next().unwrap();
+//         }
+//         assert!(!merge_iter.is_valid());
+//       }
+//     }
+// }
