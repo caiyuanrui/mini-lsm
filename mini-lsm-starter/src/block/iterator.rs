@@ -12,16 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{io::Cursor, sync::Arc};
 
 use bytes::Buf;
 
 use crate::key::{KeySlice, KeyVec};
 
-use super::{
-    builder::{KEY_OVERLAP_LEN_SIZE, REST_KEY_LEN_SIZE, VALUE_LEN_SIZE},
-    Block,
-};
+use super::Block;
 
 /// Iterates on a block.
 #[derive(Debug, Default)]
@@ -93,10 +90,15 @@ impl BlockIterator {
     }
 
     fn load_first_key(&mut self) {
-        let key_len = self.block.data[KEY_OVERLAP_LEN_SIZE..].as_ref().get_u16() as usize;
-        const FIRST_KEY_BEGIN: usize = KEY_OVERLAP_LEN_SIZE + REST_KEY_LEN_SIZE;
-        let key = self.block.data[FIRST_KEY_BEGIN..FIRST_KEY_BEGIN + key_len].to_vec();
-        self.first_key = KeyVec::from_vec(key);
+        // key_overlap_len (u16) | key_overlap (0) | rest_key_len (u16) | rest_key (rest_key_len) | timestamp (u64)
+        let mut cursor = Cursor::new(&self.block.data);
+        let key_overlap_len = cursor.get_u16();
+        assert_eq!(key_overlap_len, 0);
+        let key_len = cursor.get_u16();
+        let key = cursor.copy_to_bytes(key_len as usize);
+        let ts = cursor.get_u64();
+        // Bytes -> Vec<u8> is a shallow copy
+        self.first_key = KeyVec::from_vec_with_ts(key.into(), ts);
     }
 
     /// Will mark the iterator as invalid if `index` is out of range `[0, num_of_elements)`.
@@ -108,26 +110,22 @@ impl BlockIterator {
         }
 
         let offset = self.block.offsets[index] as usize;
-        let key_overlap_len = self.block.data[offset..].as_ref().get_u16() as usize;
-        let rest_key_len = self.block.data[offset + KEY_OVERLAP_LEN_SIZE..]
-            .as_ref()
-            .get_u16() as usize;
-        let rest_key = &self.block.data[offset + KEY_OVERLAP_LEN_SIZE + REST_KEY_LEN_SIZE
-            ..offset + KEY_OVERLAP_LEN_SIZE + REST_KEY_LEN_SIZE + rest_key_len];
+        let mut cursor = Cursor::new(&self.block.data[offset..]);
 
-        let mut complete_key = KeyVec::new();
-        complete_key.append(&self.first_key.raw_ref()[..key_overlap_len]);
-        complete_key.append(rest_key);
+        let overlap_key_len = cursor.get_u16();
+        let overlap_key = &self.first_key.key_ref()[..overlap_key_len as usize];
+        let rest_key_len = cursor.get_u16();
+        let mut key = Vec::with_capacity(overlap_key_len as usize + rest_key_len as usize);
+        key.extend_from_slice(overlap_key);
+        cursor.copy_to_slice(&mut key[overlap_key_len as usize..]);
+        let ts = cursor.get_u64();
+        let key = KeyVec::from_vec_with_ts(key, ts);
 
-        let value_len_offset = offset + KEY_OVERLAP_LEN_SIZE + REST_KEY_LEN_SIZE + rest_key_len;
-        let value_len = self.block.data[value_len_offset..].as_ref().get_u16() as usize;
-
+        let value_len = cursor.get_u16();
+        let value_offset = offset + cursor.position() as usize;
         self.idx = index;
-        self.key = complete_key;
-        self.value_range = (
-            value_len_offset + VALUE_LEN_SIZE,
-            value_len_offset + VALUE_LEN_SIZE + value_len,
-        );
+        self.key = key;
+        self.value_range = (value_offset, value_offset + value_len as usize);
     }
 
     /// Move to the next key in the block.

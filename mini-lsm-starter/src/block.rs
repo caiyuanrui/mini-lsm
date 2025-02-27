@@ -16,7 +16,6 @@ mod builder;
 mod iterator;
 
 pub use builder::BlockBuilder;
-use builder::OFFSET_SIZE;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub use iterator::BlockIterator;
 
@@ -47,11 +46,11 @@ impl Block {
     pub fn decode(data: &[u8]) -> Self {
         let extra_start = data.len() - size_of::<u16>();
         let num_of_elements = (&data[extra_start..]).get_u16();
-        let offset_start = extra_start - OFFSET_SIZE * num_of_elements as usize;
+        let offset_start = extra_start - size_of::<u16>() * num_of_elements as usize;
         Self {
             data: data[..offset_start].to_vec(),
             offsets: data[offset_start..extra_start]
-                .chunks(OFFSET_SIZE)
+                .chunks_exact(size_of::<u16>())
                 .map(|mut chunk| chunk.get_u16())
                 .collect(),
         }

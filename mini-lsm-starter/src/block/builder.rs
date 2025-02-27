@@ -18,13 +18,9 @@ use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
 
-// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | value_len (u16) | value (value_len) |
-pub(super) const KEY_OVERLAP_LEN_SIZE: usize = size_of::<u16>();
-pub(super) const REST_KEY_LEN_SIZE: usize = size_of::<u16>();
-pub(super) const VALUE_LEN_SIZE: usize = size_of::<u16>();
-pub(super) const OFFSET_SIZE: usize = size_of::<u16>();
-
 // After prefix encoding, the key's layout becomes like this
+// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u64) | value_len (u16) | value (value_len) |
+
 /// Builds a block.
 pub struct BlockBuilder {
     /// Offsets of each key-value entries.
@@ -50,7 +46,7 @@ impl BlockBuilder {
 
     pub fn key_overlap_len(&self, key: &[u8]) -> usize {
         self.first_key
-            .raw_ref()
+            .key_ref()
             .iter()
             .zip(key.iter())
             .take_while(|(b1, b2)| b1 == b2)
@@ -61,29 +57,35 @@ impl BlockBuilder {
     /// Data is stored in big-endian byte order.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        let key_overlap_len = self.key_overlap_len(key.raw_ref());
-        let rest_key_len = key.len() - key_overlap_len;
+        const KEY_OVERLAP_LEN_SIZE: usize = size_of::<u16>();
+        const REST_KEY_LEN_SIZE: usize = size_of::<u16>();
+        const TIMESTAMP_SIZE: usize = size_of::<u64>();
+        const VALUE_LEN_SIZE: usize = size_of::<u16>();
+        const OFFSET_SIZE: usize = size_of::<u16>();
+
+        let key_overlap_len = self.key_overlap_len(key.key_ref());
+        let rest_key_len = key.key_len() - key_overlap_len;
+        let estimated_size = KEY_OVERLAP_LEN_SIZE
+            + REST_KEY_LEN_SIZE
+            + rest_key_len
+            + TIMESTAMP_SIZE
+            + VALUE_LEN_SIZE
+            + value.len()
+            + OFFSET_SIZE;
 
         if self.is_empty() {
             assert_eq!(key_overlap_len, 0);
             self.first_key = key.to_key_vec();
-        } else if self.current_size()
-            + rest_key_len
-            + value.len()
-            + KEY_OVERLAP_LEN_SIZE
-            + REST_KEY_LEN_SIZE
-            + VALUE_LEN_SIZE
-            > self.block_size
-        {
+        } else if self.current_size() + estimated_size > self.block_size {
             return false;
         }
 
         self.offsets.push(self.data.len() as u16);
-
-        // | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) |
+        // | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u64) |
         self.data.put_u16(key_overlap_len as u16);
         self.data.put_u16(rest_key_len as u16);
-        self.data.put_slice(&key.raw_ref()[key_overlap_len..]);
+        self.data.put_slice(&key.key_ref()[key_overlap_len..]);
+        self.data.put_u64(key.ts());
         self.data.put_u16(value.len() as u16);
         self.data.put_slice(value);
 
@@ -105,7 +107,6 @@ impl BlockBuilder {
 
     /// Data Section + Offset Section + Extra
     fn current_size(&self) -> usize {
-        const EXTRA_SIZE: usize = size_of::<u16>();
-        self.data.len() + self.offsets.len() * OFFSET_SIZE + EXTRA_SIZE
+        self.data.len() + self.offsets.len() * size_of::<u16>() + size_of::<u16>()
     }
 }
