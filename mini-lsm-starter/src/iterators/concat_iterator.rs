@@ -195,7 +195,7 @@ mod my_tests {
             assert!(
                 iter.is_valid(),
                 "{} {}",
-                String::from_utf8(expected_key.raw_ref().to_vec()).unwrap(),
+                String::from_utf8(expected_key.key_ref().to_vec()).unwrap(),
                 String::from_utf8(expected_value.to_vec()).unwrap()
             );
             assert_eq!(expected_key.as_key_slice(), iter.key());

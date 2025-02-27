@@ -76,14 +76,11 @@ where
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        self.current
-            .as_ref()
-            .map(|c| KeySlice::from_slice(c.1.key().raw_ref()))
-            .unwrap_or(KeySlice::from_slice(&[]))
+        self.current.as_ref().map(|c| c.1.key()).unwrap()
     }
 
     fn value(&self) -> &[u8] {
-        self.current.as_ref().map(|c| c.1.value()).unwrap_or(&[])
+        self.current.as_ref().map(|c| c.1.value()).unwrap()
     }
 
     fn is_valid(&self) -> bool {
@@ -178,7 +175,7 @@ mod my_tests {
         }
         for (key, value) in expected_data {
           assert!(merge_iter.is_valid());
-          assert_eq!(merge_iter.key().raw_ref(), key.as_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(merge_iter.key().raw_ref()));
+          assert_eq!(merge_iter.key().key_ref(), key.as_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(merge_iter.key().key_ref()));
           assert_eq!(merge_iter.value(), value.as_ref(), "Value Mismatch: {} {}", to_string(&value), to_string(merge_iter.value()));
           merge_iter.next().unwrap();
         }

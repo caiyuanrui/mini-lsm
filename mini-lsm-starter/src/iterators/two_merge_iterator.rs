@@ -134,7 +134,7 @@ mod my_tests {
 
             for (key, value) in expect_data {
                 assert!(iter.is_valid());
-                assert_eq!(key.as_ref(), iter.key().raw_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(iter.key().raw_ref()));
+                assert_eq!(key.as_ref(), iter.key().key_ref(), "Key Mismatch: {} {}", to_string(&key), to_string(iter.key().key_ref()));
                 assert_eq!(value.as_ref(), iter.value(), "Value Mismatch: {} {}", to_string(&value), to_string(iter.value()));
                 iter.next().unwrap();
             }
