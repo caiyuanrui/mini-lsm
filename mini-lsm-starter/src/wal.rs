@@ -19,10 +19,13 @@ use std::sync::Arc;
 use std::{fs::File, io::Write};
 
 use anyhow::{bail, Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
+use crate::key::{KeyBytes, KeySlice};
+
+// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
@@ -38,7 +41,7 @@ impl Wal {
             .with_context(|| format!("failed to create wal file {display_path}"))
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
@@ -46,22 +49,20 @@ impl Wal {
             .with_context(|| format!("failed to open wal file {}", path.as_ref().display()))?;
         let mut buf = Vec::with_capacity(file.metadata()?.len() as usize);
         file.read_to_end(&mut buf)?;
-        let mut cursor = Cursor::new(buf);
+        let mut cursor = Cursor::new(buf.as_slice());
         while cursor.has_remaining() {
-            let key_len = cursor.get_u32();
+            let offset = cursor.position() as usize;
+            let key_len = cursor.get_u16();
             let key = cursor.copy_to_bytes(key_len as usize);
-            let value_len = cursor.get_u32();
+            let ts = cursor.get_u64();
+            let value_len = cursor.get_u16();
             let value = cursor.copy_to_bytes(value_len as usize);
+            let hash = crc32fast::hash(&buf[offset..cursor.position() as usize]);
             let checksum = cursor.get_u32();
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&key_len.to_be_bytes());
-            hasher.update(&key);
-            hasher.update(&value_len.to_be_bytes());
-            hasher.update(&value);
-            if checksum != hasher.finalize() {
+            if checksum != hash {
                 bail!("wal checksum mismatch")
             }
-            skiplist.insert(key, value);
+            skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
         }
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
@@ -69,20 +70,17 @@ impl Wal {
     }
 
     /// Note that data is persisted only when `sync` is called.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // | key_len | key | value_len | value | checksum |
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
+        // | key_len | key | ts (u64) | value_len | value | checksum |
+        let mut buf = BytesMut::with_capacity(key.raw_len() + value.len());
+        buf.put_u16(key.key_len() as u16);
+        buf.put_slice(key.key_ref());
+        buf.put_u64(key.ts());
+        buf.put_u16(value.len() as u16);
+        buf.put_slice(value);
+        buf.put_u32(crc32fast::hash(&buf));
         let mut file = self.file.lock();
-        let (key_len, value_len) = (key.len() as u32, value.len() as u32);
-        file.write_all(&key_len.to_be_bytes())?;
-        file.write_all(key)?;
-        file.write_all(&value_len.to_be_bytes())?;
-        file.write_all(value)?;
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&key_len.to_be_bytes());
-        hasher.update(key);
-        hasher.update(&value_len.to_be_bytes());
-        hasher.update(value);
-        file.write_all(&hasher.finalize().to_be_bytes())?;
+        file.write_all(&buf.freeze())?;
         Ok(())
     }
 

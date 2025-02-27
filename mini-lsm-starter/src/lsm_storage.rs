@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::ops::{Bound, Not, RangeBounds};
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
@@ -36,10 +36,10 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, TS_RANGE_BEGIN};
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_bound, MemTable};
+use crate::mem_table::{map_bound, map_bound_plus_ts, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
@@ -305,6 +305,14 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn mvcc(&self) -> &LsmMvccInner {
+        self.mvcc.as_ref().unwrap()
+    }
+
+    pub(crate) fn manifest(&self) -> &Manifest {
+        self.manifest.as_ref().unwrap()
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
@@ -434,7 +442,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: Arc::new(options),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
         storage.sync_dir()?;
@@ -454,58 +462,76 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let key_slice = KeySlice::from_slice(key, TS_RANGE_BEGIN);
         let snapshot = {
             let state = self.state.read();
             Arc::clone(&state)
         };
 
-        if let Some(value) = snapshot.memtable.get(key) {
-            return Ok(value.is_empty().not().then_some(value));
+        let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        memtable_iters.push(Box::new(snapshot.memtable.scan(
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+        )));
+        for memtable in &snapshot.imm_memtables {
+            memtable_iters.push(Box::new(memtable.scan(
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+            )));
         }
+        let memtable_iter = MergeIterator::create(memtable_iters);
 
-        for imm_memtable in &snapshot.imm_memtables {
-            if let Some(value) = imm_memtable.get(key) {
-                return Ok(value.is_empty().not().then_some(value));
+        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+
+        let may_containe_key = |table: &SsTable, key: &[u8]| {
+            key >= table.first_key().key_ref()
+                && key <= table.last_key().key_ref()
+                && table.may_contain_key(key)
+        };
+
+        for id in &snapshot.l0_sstables {
+            let table = snapshot.sstables[id].clone();
+            if may_containe_key(&table, key) {
+                l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                    table,
+                    KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                )?));
             }
         }
+        let l0_iter = MergeIterator::create(l0_iters);
 
-        for idx in &snapshot.l0_sstables {
-            let sst_table = match snapshot.sstables.get(idx) {
-                Some(sst_table) if sst_table.may_contain_key(key) => sst_table.clone(),
-                _ => continue,
-            };
-            let iter = SsTableIterator::create_and_seek_to_key(
-                sst_table.clone(),
+        let mut level_iters = Vec::with_capacity(snapshot.levels.len());
+        for (_, level) in &snapshot.levels {
+            let mut sstables = Vec::with_capacity(level.len());
+            for id in level {
+                let table = snapshot.sstables[id].clone();
+                if may_containe_key(&table, key) {
+                    sstables.push(table);
+                }
+            }
+            level_iters.push(Box::new(SstConcatIterator::create_and_seek_to_key(
+                sstables,
                 KeySlice::from_slice(key, TS_RANGE_BEGIN),
-            )?;
-            if iter.is_valid() && iter.key().key_ref() == key {
-                if iter.value() == b"" {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(iter.value())));
-            }
+            )?));
         }
+        let level_iter = MergeIterator::create(level_iters);
 
-        for (k, level) in snapshot.levels.iter() {
-            let sstables: Vec<_> = level
-                .iter()
-                .map(|id| snapshot.sstables[id].clone())
-                .collect();
-            let concat_iter = SstConcatIterator::create_and_seek_to_key(sstables, key_slice)?;
-            if concat_iter.is_valid() && concat_iter.key().key_ref() == key {
-                if concat_iter.value() == b"" {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(concat_iter.value())));
-            }
+        let iter = LsmIterator::new(
+            TwoMergeIterator::create(
+                TwoMergeIterator::create(memtable_iter, l0_iter)?,
+                level_iter,
+            )?,
+            Bound::Unbounded,
+        )?;
+        if iter.is_valid() && iter.key() == key && iter.value() != b"" {
+            return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
-
         Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let _lock = self.mvcc().write_lock.lock();
+        let ts = self.mvcc().latest_commit_ts() + 1;
         for record in batch {
             let (key, value) = match record {
                 WriteBatchRecord::Put(key, value) => {
@@ -518,9 +544,13 @@ impl LsmStorageInner {
                     (key.as_ref(), b"".as_ref())
                 }
             };
-            self.state.read().memtable.put(key, value)?;
+            self.state
+                .read()
+                .memtable
+                .put(KeySlice::from_slice(key, ts), value)?;
             self.try_freeze()?;
         }
+        self.mvcc().update_commit_ts(ts);
         Ok(())
     }
 
@@ -578,7 +608,7 @@ impl LsmStorageInner {
             Arc::new(MemTable::create(memtable_id))
         };
         self.freeze_memtable(memtable)?;
-        self.manifest.as_ref().unwrap().add_record(
+        self.manifest().add_record(
             state_lock_observer,
             ManifestRecord::NewMemtable(memtable_id),
         )?;
@@ -644,9 +674,7 @@ impl LsmStorageInner {
             std::fs::remove_file(self.path_of_wal(sst_id)).context("failed to remove wal file")?;
         }
 
-        self.manifest
-            .as_ref()
-            .unwrap()
+        self.manifest()
             .add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
 
         self.sync_dir()?;
@@ -672,13 +700,16 @@ impl LsmStorageInner {
 
         let memtable_iter = {
             let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-            memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
-            memtable_iters.extend(
-                snapshot
-                    .imm_memtables
-                    .iter()
-                    .map(|x| Box::new(x.scan(lower, upper))),
-            );
+            memtable_iters.push(Box::new(snapshot.memtable.scan(
+                map_bound_plus_ts(lower, TS_RANGE_BEGIN),
+                map_bound_plus_ts(upper, TS_RANGE_END),
+            )));
+            memtable_iters.extend(snapshot.imm_memtables.iter().map(|x| {
+                Box::new(x.scan(
+                    map_bound_plus_ts(lower, TS_RANGE_BEGIN),
+                    map_bound_plus_ts(upper, TS_RANGE_END),
+                ))
+            }));
             MergeIterator::create(memtable_iters)
         };
 

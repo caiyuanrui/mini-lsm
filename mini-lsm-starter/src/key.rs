@@ -212,3 +212,16 @@ impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
         (self.0.as_ref(), Reverse(self.1)).cmp(&(other.0.as_ref(), Reverse(other.1)))
     }
 }
+
+#[cfg(test)]
+mod my_tests {
+    use super::*;
+
+    #[test]
+    fn test_key_slice_ord() {
+        assert_eq!(KeySlice::from_slice(b"0", 0), KeySlice::from_slice(b"0", 0));
+        assert_ne!(KeySlice::from_slice(b"0", 1), KeySlice::from_slice(b"0", 0));
+        assert_ne!(KeySlice::from_slice(b"1", 0), KeySlice::from_slice(b"0", 0));
+        assert!(KeySlice::from_slice(b"0", 1) < KeySlice::from_slice(b"0", 0));
+    }
+}
