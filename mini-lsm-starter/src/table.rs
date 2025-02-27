@@ -51,7 +51,10 @@ impl BlockMeta {
         let additional = block_meta
             .iter()
             .map(|meta| {
-                meta.first_key.len() + meta.last_key.len() + size_of::<u32>() + 2 * size_of::<u16>()
+                meta.first_key.raw_len()
+                    + meta.last_key.raw_len()
+                    + size_of::<u32>()
+                    + 2 * size_of::<u16>()
             })
             .sum::<usize>()
             + size_of::<u32>();
@@ -61,12 +64,14 @@ impl BlockMeta {
         buf.put_u32(block_meta.len() as u32);
         for meta in block_meta {
             buf.put_u32(meta.offset as u32);
-            buf.put_u16(meta.first_key.len() as u16);
-            buf.put_slice(meta.first_key.raw_ref());
-            buf.put_u16(meta.last_key.len() as u16);
-            buf.put_slice(meta.last_key.raw_ref());
+            buf.put_u16(meta.first_key.raw_len() as u16);
+            buf.put_slice(meta.first_key.key_ref());
+            buf.put_u64(meta.first_key.ts());
+            buf.put_u16(meta.last_key.raw_len() as u16);
+            buf.put_slice(meta.last_key.key_ref());
+            buf.put_u64(meta.last_key.ts());
         }
-        buf.put_u32(crc32fast::hash(&buf[original_len + 4..]));
+        buf.put_u32(crc32fast::hash(&buf[original_len + size_of::<u32>()..]));
     }
 
     /// Decode block meta from a buffer.
@@ -77,9 +82,15 @@ impl BlockMeta {
         for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16();
-            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len as usize));
+            let first_key = KeyBytes::from_bytes_with_ts(
+                buf.copy_to_bytes(first_key_len as usize),
+                buf.get_u64(),
+            );
             let last_key_len = buf.get_u16();
-            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_key_len as usize));
+            let last_key = KeyBytes::from_bytes_with_ts(
+                buf.copy_to_bytes(last_key_len as usize),
+                buf.get_u64(),
+            );
             block_meta.push(BlockMeta {
                 offset,
                 first_key,
@@ -316,13 +327,21 @@ mod my_tests {
         let block_meta = vec![
             BlockMeta {
                 offset: 42,
-                first_key: KeyBytes::from_bytes(bytes::Bytes::from_static(b"hello")),
-                last_key: KeyBytes::from_bytes(bytes::Bytes::from_static(b"23333")),
+                first_key: KeyBytes::for_testing_from_bytes_no_ts(bytes::Bytes::from_static(
+                    b"hello",
+                )),
+                last_key: KeyBytes::for_testing_from_bytes_no_ts(bytes::Bytes::from_static(
+                    b"23333",
+                )),
             },
             BlockMeta {
                 offset: 69,
-                first_key: KeyBytes::from_bytes(bytes::Bytes::from_static(&[1; u16::MAX as usize])),
-                last_key: KeyBytes::from_bytes(bytes::Bytes::from_static(&[2; u16::MAX as usize])),
+                first_key: KeyBytes::for_testing_from_bytes_no_ts(bytes::Bytes::from_static(
+                    &[1; u16::MAX as usize],
+                )),
+                last_key: KeyBytes::for_testing_from_bytes_no_ts(bytes::Bytes::from_static(
+                    &[2; u16::MAX as usize],
+                )),
             },
         ];
 
