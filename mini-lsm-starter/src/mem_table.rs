@@ -190,8 +190,7 @@ impl MemTable {
             |map| map.range((map_key_bound(lower), map_key_bound(upper))),
             (KeyBytes::new(), Bytes::new()),
         );
-        let entry = iter.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
-        iter.with_mut(|x| *x.item = entry);
+        iter.next().unwrap();
         iter
     }
 

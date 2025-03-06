@@ -699,17 +699,24 @@ impl LsmStorageInner {
         };
 
         let memtable_iter = {
+            let lower = match lower {
+                Bound::Included(_) => map_bound_plus_ts(lower, TS_RANGE_BEGIN),
+                Bound::Excluded(_) => map_bound_plus_ts(lower, TS_RANGE_END),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let upper = match upper {
+                Bound::Included(_) => map_bound_plus_ts(upper, TS_RANGE_END),
+                Bound::Excluded(_) => map_bound_plus_ts(upper, TS_RANGE_BEGIN),
+                Bound::Unbounded => Bound::Unbounded,
+            };
             let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-            memtable_iters.push(Box::new(snapshot.memtable.scan(
-                map_bound_plus_ts(lower, TS_RANGE_BEGIN),
-                map_bound_plus_ts(upper, TS_RANGE_END),
-            )));
-            memtable_iters.extend(snapshot.imm_memtables.iter().map(|x| {
-                Box::new(x.scan(
-                    map_bound_plus_ts(lower, TS_RANGE_BEGIN),
-                    map_bound_plus_ts(upper, TS_RANGE_END),
-                ))
-            }));
+            memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
+            memtable_iters.extend(
+                snapshot
+                    .imm_memtables
+                    .iter()
+                    .map(|x| Box::new(x.scan(lower, upper))),
+            );
             MergeIterator::create(memtable_iters)
         };
 

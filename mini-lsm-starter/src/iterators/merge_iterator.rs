@@ -68,7 +68,6 @@ impl<I: StorageIterator> MergeIterator<I> {
             .enumerate()
             .filter_map(|(i, iter)| iter.is_valid().then_some(HeapWrapper(i, iter)))
             .collect::<BinaryHeap<_>>();
-        // current iter must be valid
         let current = iters.pop();
         Self { iters, current }
     }
