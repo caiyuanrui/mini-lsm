@@ -37,21 +37,23 @@ pub struct LsmIterator {
     end: Bound<Bytes>,
     prev_key: Vec<u8>,
     is_valid: bool,
+    read_ts: u64,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(inner: LsmIteratorInner, end: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(inner: LsmIteratorInner, end: Bound<Bytes>, read_ts: u64) -> Result<Self> {
         let mut iter = Self {
             is_valid: inner.is_valid(),
             inner,
             end,
+            read_ts,
             prev_key: Vec::new(),
         };
         iter.move_to_key()?;
         Ok(iter)
     }
 
-    /// advance inner iterator until
+    /// advance the inner iterator unless
     /// 1. inner iterator is invalid
     /// 2. exceed the end bound
     fn next_inner(&mut self) -> Result<()> {
@@ -68,7 +70,6 @@ impl LsmIterator {
         Ok(())
     }
 
-    /// move to the key with newest version and non-empty value
     fn move_to_key(&mut self) -> Result<()> {
         loop {
             // skip identical keys with older version
@@ -80,6 +81,23 @@ impl LsmIterator {
             }
             self.prev_key.clear();
             self.prev_key.extend(self.inner.key().key_ref());
+            // 1/3 1/2 1/1 2/4 2/2 read_ts = 2
+            //      |       |
+            // last_key  prev_key
+            // skip identical keys with newer timestamp
+            while self.is_valid
+                && self.inner.key().key_ref() == self.prev_key
+                && self.inner.key().ts() > self.read_ts
+            {
+                self.next_inner()?;
+            }
+            if !self.is_valid {
+                break;
+            }
+            // oops! we skip all the keys and stop at the next different key
+            if self.inner.key().key_ref() != self.prev_key {
+                continue;
+            }
             // skip deleted keys
             if !self.inner.value().is_empty() {
                 break;
