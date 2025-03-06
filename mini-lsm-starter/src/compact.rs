@@ -34,7 +34,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, KeyVec};
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -134,33 +134,36 @@ pub enum CompactionOptions {
 
 impl LsmStorageInner {
     /// compact the sstables produced by the iterator and return a sorted run.
+    /// Note that, the `compact_to_bottom_level` is ignored
+    /// and we allow one SST exceeds the size limit to contain all the same keys in one SST.
+    /// (week3 day2)
     fn compact_with_iter(
         &self,
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
         compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
-        let mut builder = None;
         let mut sstables = Vec::new();
+        let mut builder = Some(SsTableBuilder::new(self.options.block_size));
+        let mut last_key = KeyVec::new(); // use empty key as None
         while iter.is_valid() {
-            if builder.is_none() {
-                builder = Some(SsTableBuilder::new(self.options.block_size));
-            }
-            let builder_inner = builder.as_mut().unwrap();
             let (key, value) = (iter.key(), iter.value());
-            if !compact_to_bottom_level || !value.is_empty() {
-                builder_inner.add(key, value);
-            }
-            if builder_inner.estimated_size() >= self.options.target_sst_size {
+            if last_key.key_ref() != key.key_ref()
+                && builder.as_ref().unwrap().estimated_size() >= self.options.target_sst_size
+            {
                 let id = self.next_sst_id();
                 sstables.push(Arc::new(builder.take().unwrap().build(
                     id,
                     Some(self.block_cache.clone()),
                     self.path_of_sst(id),
                 )?));
+                builder = Some(SsTableBuilder::new(self.options.block_size));
             }
+            builder.as_mut().unwrap().add(key, value);
+            last_key = key.to_key_vec();
             iter.next()?;
         }
-        if let Some(builder) = builder {
+        let builder = builder.unwrap();
+        if !builder.is_empty() {
             let id = self.next_sst_id();
             sstables.push(Arc::new(builder.build(
                 id,
@@ -430,53 +433,3 @@ impl LsmStorageInner {
         Ok(Some(handle))
     }
 }
-
-// #[cfg(any(debug_assertions, test))]
-// pub fn print_levels_for_debug(snapshot: &LsmStorageState) {
-//     let mut levels: Vec<(usize, Vec<(String, String)>)> = Vec::new();
-//     let mut key_ranges: Vec<(String, String)> = Vec::new();
-//     for sst_id in &snapshot.l0_sstables {
-//         let sst = &snapshot.sstables[sst_id];
-//         let key = String::from_utf8(sst.first_key().key_ref().to_vec()).unwrap();
-//         let value = String::from_utf8(sst.last_key().key_ref().to_vec()).unwrap();
-//         key_ranges.push((key, value));
-//     }
-//     levels.push((0, key_ranges));
-
-//     for (level, sst_ids) in &snapshot.levels {
-//         let mut key_ranges: Vec<(String, String)> = Vec::new();
-//         for sst_id in sst_ids {
-//             let sst = &snapshot.sstables[sst_id];
-//             let key = String::from_utf8(sst.first_key().key_ref().to_vec()).unwrap();
-//             let value = String::from_utf8(sst.last_key().key_ref().to_vec()).unwrap();
-//             key_ranges.push((key, value));
-//         }
-//         levels.push((*level, key_ranges));
-//     }
-
-//     for (level, key_ranges) in levels {
-//         log::debug!("========== L{level} ==========");
-//         for (k1, k2) in key_ranges {
-//             log::debug!("{k1} {k2}");
-//         }
-//     }
-// }
-
-// #[cfg(any(debug_assertions, test))]
-// fn get_first_last_key_from_iter_for_debug(
-//     mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
-// ) -> (String, String) {
-//     let mut first_key = Vec::new();
-//     let mut last_key = Vec::new();
-//     while iter.is_valid() {
-//         last_key = iter.key().key_ref().to_vec();
-//         if first_key.is_empty() {
-//             first_key = iter.key().key_ref().to_vec();
-//         }
-//         iter.next().unwrap();
-//     }
-//     (
-//         String::from_utf8(first_key).unwrap(),
-//         String::from_utf8(last_key).unwrap(),
-//     )
-// }
