@@ -73,10 +73,10 @@ impl LsmIterator {
     fn move_to_key(&mut self) -> Result<()> {
         loop {
             // skip identical keys with older version
-            while self.is_valid && self.inner.key().key_ref() == self.prev_key {
+            while self.inner.is_valid() && self.inner.key().key_ref() == self.prev_key {
                 self.next_inner()?;
             }
-            if !self.is_valid {
+            if !self.inner.is_valid() {
                 break;
             }
             self.prev_key.clear();
@@ -85,13 +85,13 @@ impl LsmIterator {
             //      |       |
             // last_key  prev_key
             // skip identical keys with newer timestamp
-            while self.is_valid
+            while self.inner.is_valid()
                 && self.inner.key().key_ref() == self.prev_key
                 && self.inner.key().ts() > self.read_ts
             {
                 self.next_inner()?;
             }
-            if !self.is_valid {
+            if !self.inner.is_valid() {
                 break;
             }
             // oops! we skip all the keys and stop at the next different key
@@ -161,10 +161,16 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn key(&self) -> Self::KeyType<'_> {
+        if !self.is_valid() {
+            panic!("invalid access to the underlying iterator");
+        }
         self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("invalid access to the underlying iterator");
+        }
         self.iter.value()
     }
 

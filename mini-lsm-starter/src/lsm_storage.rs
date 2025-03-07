@@ -316,7 +316,7 @@ impl LsmStorageInner {
         let mut state = LsmStorageState::create(&options);
         let block_cache = Arc::new(BlockCache::new(1024));
         let mut next_sst_id = 1;
-        let mut max_ts = TS_MIN;
+        let mut latest_commit_ts = TS_MIN;
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -376,34 +376,29 @@ impl LsmStorageInner {
                     }
                 }
             }
+
             // recover MemTables
-            if !memtables.is_empty() && options.enable_wal {
-                let memtable_id = memtables.pop_last().unwrap();
-                state.memtable = Arc::new(MemTable::recover_from_wal(
-                    memtable_id,
-                    Self::path_of_wal_static(path, memtable_id),
-                )?);
-                max_ts = max_ts.max(
-                    state
-                        .memtable
-                        .map
-                        .iter()
-                        .map(|entry| entry.key().ts())
-                        .max()
-                        .unwrap_or(TS_MIN),
-                );
-                for imm_memtable_id in memtables.into_iter().rev() {
-                    state.imm_memtables.push(Arc::new(
-                        MemTable::recover_from_wal(
-                            imm_memtable_id,
-                            Self::path_of_wal_static(path, imm_memtable_id),
-                        )
-                        .with_context(|| {
-                            format!("failed to recover imm_memtable from {imm_memtable_id}.wal")
-                        })?,
-                    ));
+            if options.enable_wal {
+                let mut wal_cnt = 0;
+                for &id in memtables.iter() {
+                    let memtable =
+                        MemTable::recover_from_wal(id, Self::path_of_wal_static(path, id))?;
+                    latest_commit_ts = latest_commit_ts.max(
+                        memtable
+                            .map
+                            .iter()
+                            .map(|entry| entry.key().ts())
+                            .max()
+                            .unwrap_or_default(),
+                    );
+                    if !memtable.is_empty() {
+                        wal_cnt += 1;
+                        state.imm_memtables.insert(0, Arc::new(memtable));
+                    }
                 }
+                log::debug!("{wal_cnt} WALs opened");
             }
+
             // recover SSTs
             let sst_cnt = AtomicUsize::new(0);
             let results: Result<Vec<_>> = state
@@ -416,7 +411,7 @@ impl LsmStorageInner {
                         Some(block_cache.clone()),
                         FileObject::open(&Self::path_of_sst_static(path, sst_id))?,
                     )?);
-                    max_ts = max_ts.max(sst.max_ts());
+                    latest_commit_ts = latest_commit_ts.max(sst.max_ts());
                     sst_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Ok::<_, anyhow::Error>((sst_id, sst))
                 })
@@ -448,7 +443,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: Arc::new(options),
-            mvcc: Some(LsmMvccInner::new(max_ts)),
+            mvcc: Some(LsmMvccInner::new(latest_commit_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
         storage.sync_dir()?;
@@ -737,6 +732,10 @@ impl LsmStorageInner {
             MergeIterator::create(memtable_iters)
         };
 
+        if memtable_iter.is_valid() {
+            println!("memtable_iter is_valid");
+        }
+
         let l0_iter = MergeIterator::create(
             snapshot
                 .l0_sstables
@@ -754,14 +753,14 @@ impl LsmStorageInner {
                 .map(|sst| match lower {
                     Bound::Included(lower) => SsTableIterator::create_and_seek_to_key(
                         sst,
-                        KeySlice::from_slice(lower, TS_RANGE_BEGIN),
+                        KeySlice::from_slice(lower, read_ts),
                     ),
                     Bound::Excluded(lower) => SsTableIterator::create_and_seek_to_key(
                         sst,
-                        KeySlice::from_slice(lower, TS_RANGE_BEGIN),
+                        KeySlice::from_slice(lower, read_ts),
                     )
                     .and_then(|mut iter| {
-                        if iter.is_valid() && iter.key().key_ref() == lower {
+                        while iter.is_valid() && iter.key().key_ref() == lower {
                             iter.next()?;
                         }
                         Ok(iter)
@@ -794,14 +793,14 @@ impl LsmStorageInner {
                     match lower {
                         Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(
                             sstables,
-                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                            KeySlice::from_slice(key, read_ts),
                         ),
                         Bound::Excluded(key) => SstConcatIterator::create_and_seek_to_key(
                             sstables,
-                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                            KeySlice::from_slice(key, read_ts),
                         )
                         .and_then(|mut iter| {
-                            if iter.is_valid() && iter.key().key_ref() == key {
+                            while iter.is_valid() && iter.key().key_ref() == key {
                                 iter.next()?;
                             }
                             Ok(iter)

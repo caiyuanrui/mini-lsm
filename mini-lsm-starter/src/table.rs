@@ -57,7 +57,8 @@ impl BlockMeta {
                     + 2 * size_of::<u16>()
             })
             .sum::<usize>()
-            + size_of::<u64>() // max timestamp
+            + size_of::<u32>()  // no. of blocks
+            + size_of::<u64>()  // max timestamp
             + size_of::<u32>(); // checksum
         buf.reserve(additional);
         let original_len = buf.len();

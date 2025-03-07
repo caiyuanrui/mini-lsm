@@ -61,17 +61,16 @@ impl SsTableBuilder {
             self.first_key.set_from_slice(key);
         }
 
+        self.max_ts = self.max_ts.max(key.ts());
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
 
         if self.builder.add(key, value) {
-            self.max_ts = self.max_ts.max(key.ts());
             self.last_key.set_from_slice(key);
             return;
         }
         self.freeze_block_builder();
 
         assert!(self.builder.add(key, value));
-        self.max_ts = self.max_ts.max(key.ts());
         self.first_key.set_from_slice(key);
         self.last_key.set_from_slice(key);
     }
@@ -150,7 +149,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom_filter),
-            max_ts: 0,
+            max_ts: self.max_ts,
         })
     }
 

@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::{LsmStorageInner, WriteBatchRecord},
+    lsm_storage::LsmStorageInner,
     mem_table::map_bound,
 };
 
@@ -48,18 +48,6 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        assert!(
-            !self.committed.load(Ordering::Acquire),
-            "cannot operate on committed txn"
-        );
-        if let Some(ref key_hashes) = self.key_hashes {
-            let read_set = &mut key_hashes.lock().1;
-            read_set.insert(farmhash::fingerprint32(key));
-        }
-        if let Some(entry) = self.local_storage.get(key) {
-            let value = entry.value();
-            return Ok((!value.is_empty()).then_some(value.clone()));
-        }
         self.inner.get_with_ts(key, self.read_ts)
     }
 
@@ -84,58 +72,20 @@ impl Transaction {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        assert!(
-            !self.committed.load(Ordering::Acquire),
-            "cannot operate on committed txn"
-        );
-        self.local_storage
-            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
-        if let Some(ref key_hashes) = self.key_hashes {
-            let write_set = &mut key_hashes.lock().0;
-            write_set.insert(farmhash::fingerprint32(key));
-        }
+        unimplemented!()
     }
 
     pub fn delete(&self, key: &[u8]) {
-        assert!(
-            !self.committed.load(Ordering::Acquire),
-            "cannot operate on committed txn"
-        );
-        self.local_storage
-            .insert(Bytes::copy_from_slice(key), Bytes::new());
-        if let Some(ref key_hashes) = self.key_hashes {
-            let write_set = &mut key_hashes.lock().0;
-            write_set.insert(farmhash::fingerprint32(key));
-        };
+        unimplemented!()
     }
 
     pub fn commit(&self) -> Result<()> {
-        assert!(
-            !self.committed.load(Ordering::Acquire),
-            "cannot operate on committed txn"
-        );
-        let batch: Vec<_> = self
-            .local_storage
-            .iter()
-            .map(|entry| {
-                if entry.value().is_empty() {
-                    WriteBatchRecord::Del(entry.key().to_owned())
-                } else {
-                    WriteBatchRecord::Put(entry.key().to_owned(), entry.value().to_owned())
-                }
-            })
-            .collect();
-        self.inner.write_batch(&batch)?;
-        self.committed.store(true, Ordering::Release);
-
         unimplemented!()
     }
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {
-        self.inner.mvcc().ts.lock().1.remove_reader(self.read_ts);
-    }
+    fn drop(&mut self) {}
 }
 
 type SkipMapRangeIter<'a> =
