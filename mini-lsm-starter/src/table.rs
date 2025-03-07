@@ -47,7 +47,7 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], max_ts: u64, buf: &mut Vec<u8>) {
         let additional = block_meta
             .iter()
             .map(|meta| {
@@ -57,10 +57,11 @@ impl BlockMeta {
                     + 2 * size_of::<u16>()
             })
             .sum::<usize>()
-            + size_of::<u32>();
+            + size_of::<u64>() // max timestamp
+            + size_of::<u32>(); // checksum
         buf.reserve(additional);
         let original_len = buf.len();
-        // | no. of blocks | meta data | checksum |
+        // | no. of blocks | meta data | max_ts |checksum |
         buf.put_u32(block_meta.len() as u32);
         for meta in block_meta {
             buf.put_u32(meta.offset as u32);
@@ -71,11 +72,12 @@ impl BlockMeta {
             buf.put_slice(meta.last_key.key_ref());
             buf.put_u64(meta.last_key.ts());
         }
+        buf.put_u64(max_ts);
         buf.put_u32(crc32fast::hash(&buf[original_len + size_of::<u32>()..]));
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: &[u8]) -> Result<Vec<BlockMeta>> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> Result<(Vec<BlockMeta>, u64)> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32();
         let checksum = crc32fast::hash(&buf[..buf.remaining() - size_of::<u32>()]);
@@ -97,10 +99,11 @@ impl BlockMeta {
                 last_key,
             })
         }
+        let max_ts = buf.get_u64();
         if checksum != buf.get_u32() {
             bail!("block meta checksum mismatch")
         }
-        Ok(block_meta)
+        Ok((block_meta, max_ts))
     }
 }
 
@@ -184,7 +187,7 @@ impl SsTable {
         let block_meta_offset = bytes[bloom_offset - BLOCK_META_OFFSET_SIZE..bloom_offset]
             .as_ref()
             .get_u32() as usize;
-        let block_meta = BlockMeta::decode_block_meta(
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(
             &bytes[block_meta_offset..bloom_offset - BLOCK_META_OFFSET_SIZE],
         )?;
 
@@ -208,7 +211,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0u64,
+            max_ts,
         })
     }
 
@@ -346,9 +349,10 @@ mod my_tests {
         ];
 
         let mut buf = Vec::new();
-        BlockMeta::encode_block_meta(block_meta.as_ref(), &mut buf);
-        let decoded = BlockMeta::decode_block_meta(buf.as_ref()).unwrap();
+        BlockMeta::encode_block_meta(block_meta.as_ref(), 42, &mut buf);
+        let (decoded, max_ts) = BlockMeta::decode_block_meta(buf.as_ref()).unwrap();
 
         assert_eq!(block_meta, decoded);
+        assert_eq!(42, max_ts);
     }
 }

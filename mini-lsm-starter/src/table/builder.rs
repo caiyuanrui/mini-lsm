@@ -21,7 +21,7 @@ use bytes::BufMut;
 use super::{bloom::Bloom, BlockMeta, FileObject, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::{KeySlice, KeyVec},
+    key::{KeySlice, KeyVec, TS_MIN},
     lsm_storage::BlockCache,
 };
 
@@ -34,6 +34,7 @@ pub struct SsTableBuilder {
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hashes: Vec<u32>,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -47,6 +48,7 @@ impl SsTableBuilder {
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
+            max_ts: TS_MIN,
         }
     }
 
@@ -62,12 +64,14 @@ impl SsTableBuilder {
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
 
         if self.builder.add(key, value) {
+            self.max_ts = self.max_ts.max(key.ts());
             self.last_key.set_from_slice(key);
             return;
         }
         self.freeze_block_builder();
 
         assert!(self.builder.add(key, value));
+        self.max_ts = self.max_ts.max(key.ts());
         self.first_key.set_from_slice(key);
         self.last_key.set_from_slice(key);
     }
@@ -123,7 +127,7 @@ impl SsTableBuilder {
         // extend from blocks data
         bytes.extend_from_slice(self.data.as_ref());
         // extend from metadata
-        BlockMeta::encode_block_meta(self.meta.as_ref(), &mut bytes);
+        BlockMeta::encode_block_meta(self.meta.as_ref(), self.max_ts, &mut bytes);
         // put extra metablock offset
         bytes.put_u32(self.data.len() as u32);
 
