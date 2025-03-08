@@ -34,7 +34,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, KeyVec};
+use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -143,26 +143,45 @@ impl LsmStorageInner {
         compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut sstables = Vec::new();
-        let mut builder = Some(SsTableBuilder::new(self.options.block_size));
-        let mut last_key = KeyVec::new(); // use empty key as None
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        let mut last_key: Vec<u8> = Vec::new();
+        let watermark = self.mvcc().watermark();
+        let mut first_key_below_watermark = false;
+
         while iter.is_valid() {
             let (key, value) = (iter.key(), iter.value());
-            if last_key.key_ref() != key.key_ref()
-                && builder.as_ref().unwrap().estimated_size() >= self.options.target_sst_size
-            {
+
+            let is_first_key = last_key != key.key_ref();
+            if is_first_key {
+                first_key_below_watermark = true;
+            }
+
+            if builder.estimated_size() >= self.options.target_sst_size && is_first_key {
                 let id = self.next_sst_id();
-                sstables.push(Arc::new(builder.take().unwrap().build(
+                sstables.push(Arc::new(builder.build(
                     id,
                     Some(self.block_cache.clone()),
                     self.path_of_sst(id),
                 )?));
-                builder = Some(SsTableBuilder::new(self.options.block_size));
+                builder = SsTableBuilder::new(self.options.block_size);
             }
-            builder.as_mut().unwrap().add(key, value);
-            last_key = key.to_key_vec();
+
+            if key.ts() > watermark {
+                first_key_below_watermark = true;
+                builder.add(key, value);
+                last_key.clear();
+                last_key.extend(key.key_ref());
+            } else if first_key_below_watermark {
+                first_key_below_watermark = false;
+                if !value.is_empty() || !compact_to_bottom_level {
+                    builder.add(key, value);
+                }
+                last_key.clear();
+                last_key.extend(key.key_ref());
+            }
+
             iter.next()?;
         }
-        let builder = builder.unwrap();
         if !builder.is_empty() {
             let id = self.next_sst_id();
             sstables.push(Arc::new(builder.build(

@@ -732,10 +732,6 @@ impl LsmStorageInner {
             MergeIterator::create(memtable_iters)
         };
 
-        if memtable_iter.is_valid() {
-            println!("memtable_iter is_valid");
-        }
-
         let l0_iter = MergeIterator::create(
             snapshot
                 .l0_sstables
