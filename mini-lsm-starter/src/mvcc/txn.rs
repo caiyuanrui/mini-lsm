@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, WriteBatchRecord},
     mem_table::map_bound,
 };
 
@@ -48,14 +48,16 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.assert();
+        if let Some(entry) = self.local_storage.get(key) {
+            let value = entry.value();
+            return Ok((!value.is_empty()).then_some(value.clone()));
+        }
         self.inner.get_with_ts(key, self.read_ts)
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        assert!(
-            !self.committed.load(Ordering::Acquire),
-            "cannot operate on committed txn"
-        );
+        self.assert();
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range((map_bound(lower), map_bound(upper))),
@@ -72,15 +74,46 @@ impl Transaction {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+        self.assert();
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
     pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+        self.assert();
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::new());
     }
 
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        while let Err(old_value) =
+            self.committed
+                .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            assert!(!old_value, "cannot operate on committed txn");
+            std::hint::spin_loop();
+        }
+
+        let mut batch = Vec::new();
+        for entry in self.local_storage.iter() {
+            let (key, value) = (entry.key(), entry.value());
+            if value.is_empty() {
+                batch.push(WriteBatchRecord::Del(key.clone()));
+            } else {
+                batch.push(WriteBatchRecord::Put(key.clone(), value.clone()));
+            }
+        }
+        self.inner.write_batch(&batch)?;
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn assert(&self) {
+        assert!(
+            !self.committed.load(Ordering::Acquire),
+            "cannot operate on committed txn"
+        );
     }
 }
 
@@ -147,7 +180,18 @@ impl TxnIterator {
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        Ok(Self { txn, iter })
+        let mut iter = Self { txn, iter };
+        iter.skip_deletes()?;
+        Ok(iter)
+    }
+}
+
+impl TxnIterator {
+    fn skip_deletes(&mut self) -> Result<()> {
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -170,7 +214,8 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        self.iter.next()
+        self.iter.next()?;
+        self.skip_deletes()
     }
 
     fn num_active_iterators(&self) -> usize {
