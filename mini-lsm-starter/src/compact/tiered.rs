@@ -49,27 +49,21 @@ impl TieredCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<TieredCompactionTask> {
-        if snapshot.levels.is_empty() || snapshot.levels.last().unwrap().1.is_empty() {
+        if snapshot.levels.len() < self.options.num_tiers || snapshot.levels.is_empty() {
             return None;
         }
         // space amplification ratio trigger
-        let current_num_iters = snapshot.levels.len();
-        let last_level_size = snapshot
-            .levels
-            .last()
-            .map(|x| x.1.len())
-            .unwrap_or_default();
+        let last_level_size = snapshot.levels.last().unwrap().1.len();
         let other_levels_size: usize = snapshot
             .levels
             .iter()
-            .take(current_num_iters - 1)
+            .take(snapshot.levels.len() - 1)
             .map(|x| x.1.len())
             .sum();
-        debug_assert!(last_level_size != 0);
-        let size_amplification_percent = other_levels_size * 100 / last_level_size;
-        if size_amplification_percent >= self.options.max_size_amplification_percent {
+        let space_amp_percent = other_levels_size as f64 * 100.0 / last_level_size as f64;
+        if space_amp_percent >= self.options.max_size_amplification_percent as f64 {
             log::debug!(
-                "compaction triggered by space amplification ratio: {size_amplification_percent}"
+                "tiered compaction triggered by space amplification ratio: {space_amp_percent}"
             );
             return Some(TieredCompactionTask {
                 tiers: snapshot.levels.clone(),
@@ -77,39 +71,36 @@ impl TieredCompactionController {
             });
         }
         // size ratio trigger
-        let mut all_previous_tiers_size = snapshot.levels[0].1.len();
-        for (i, (_, tier)) in snapshot.levels.iter().enumerate().skip(1) {
-            let value = tier.len() * 100 / all_previous_tiers_size;
-            if value > (100 + self.options.size_ratio) {
-                if i <= self.options.min_merge_width {
-                    break;
-                }
-                let tiers: Vec<_> = snapshot.levels.iter().take(i).cloned().collect();
-                log::debug!(
-                    "compaction triggered by size ratio: {value} > {}",
-                    100 + self.options.size_ratio
-                );
+        let mut size = 0;
+        for id in 0..(snapshot.levels.len() - 1) {
+            size += snapshot.levels[id].1.len();
+            let next_level_size = snapshot.levels[id + 1].1.len();
+            let current_size_ratio = next_level_size as f64 / size as f64;
+            if current_size_ratio > 100.0 + self.options.size_ratio as f64
+                && id + 1 >= self.options.min_merge_width
+            {
+                log::debug!("tiered compaction triggered by size ratio: {current_size_ratio}");
                 return Some(TieredCompactionTask {
-                    bottom_tier_included: false,
-                    tiers,
+                    tiers: snapshot.levels.iter().take(id + 1).cloned().collect(),
+                    bottom_tier_included: id + 1 == snapshot.levels.len(),
                 });
             }
-            all_previous_tiers_size += tier.len();
         }
         // reduce sorted runs
-        if self
-            .options
-            .max_merge_width
-            .is_some_and(|max_merge_width| current_num_iters > max_merge_width)
-        {
-            log::debug!("compaction triggered by reducing sorted runs");
-            return Some(TieredCompactionTask {
-                tiers: snapshot.levels.clone(),
-                bottom_tier_included: true,
-            });
-        }
-
-        None
+        let num_tiers_to_reduce = snapshot
+            .levels
+            .len()
+            .min(self.options.max_merge_width.unwrap_or(usize::MAX));
+        log::debug!("tiered compaction triggered by reducing sorted runs");
+        Some(TieredCompactionTask {
+            tiers: snapshot
+                .levels
+                .iter()
+                .take(num_tiers_to_reduce)
+                .cloned()
+                .collect(),
+            bottom_tier_included: snapshot.levels.len() == num_tiers_to_reduce,
+        })
     }
 
     pub fn apply_compaction_result(

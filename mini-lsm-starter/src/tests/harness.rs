@@ -386,7 +386,13 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
         }) => {
             let size_ratio_trigger = (100.0 + size_ratio as f64) / 100.0;
             assert_eq!(l0_sst_num, 0);
-            assert!(level_size.len() <= num_tiers);
+            println!("size_ratio_trigger: {size_ratio_trigger}");
+            assert!(
+                level_size.len() <= num_tiers,
+                "{} {}",
+                level_size.len(),
+                num_tiers
+            );
             let mut sum_size = level_size[0];
             for idx in 1..level_size.len() {
                 let this_size = level_size[idx];
