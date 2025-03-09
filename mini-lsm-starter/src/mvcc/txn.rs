@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashSet,
+    collections::BTreeSet,
     ops::Bound,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -42,7 +42,56 @@ pub struct Transaction {
     pub(crate) local_storage: Arc<SkipMap<Bytes, Bytes>>,
     pub(crate) committed: Arc<AtomicBool>,
     /// Write set and read set
-    pub(crate) key_hashes: Option<Mutex<(HashSet<u32>, HashSet<u32>)>>,
+    pub(crate) key_hashes: Option<Mutex<(WriteSet, ReadSet)>>,
+}
+
+#[derive(Debug, Default)]
+pub struct ReadSet {
+    point_reads: BTreeSet<Bytes>,
+    range_reads: Vec<(Bound<Bytes>, Bound<Bytes>)>,
+}
+
+#[derive(Debug, Default)]
+pub struct WriteSet {
+    point_writes: BTreeSet<Bytes>,
+}
+
+impl ReadSet {
+    fn add_point(&mut self, key: Bytes) {
+        self.point_reads.insert(key);
+    }
+
+    fn add_range(&mut self, lower: Bound<Bytes>, upper: Bound<Bytes>) {
+        self.range_reads.push((lower, upper));
+    }
+
+    fn is_key_overlap(&self, key: &Bytes) -> bool {
+        if self.point_reads.contains(key) {
+            return true;
+        }
+        for (lower, upper) in &self.range_reads {
+            let lower_ok = match lower {
+                Bound::Unbounded => true,
+                Bound::Included(lower) => lower <= key,
+                Bound::Excluded(lower) => lower < key,
+            };
+            let upper_ok = match upper {
+                Bound::Unbounded => true,
+                Bound::Included(upper) => upper >= key,
+                Bound::Excluded(upper) => upper > key,
+            };
+            if lower_ok && upper_ok {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl WriteSet {
+    fn add_point(&mut self, key: Bytes) {
+        self.point_writes.insert(key);
+    }
 }
 
 impl Transaction {
@@ -53,7 +102,7 @@ impl Transaction {
         );
         if let Some(ref key_hashes) = self.key_hashes {
             let read_set = &mut key_hashes.lock().1;
-            read_set.insert(farmhash::hash32(key));
+            read_set.add_point(Bytes::copy_from_slice(key));
         }
         if let Some(entry) = self.local_storage.get(key) {
             let value = entry.value();
@@ -67,6 +116,10 @@ impl Transaction {
             !self.committed.load(Ordering::Acquire),
             "cannot operate on committed txn"
         );
+        if let Some(ref key_hashes) = self.key_hashes {
+            let read_set = &mut key_hashes.lock().1;
+            read_set.add_range(map_bound(lower), map_bound(upper));
+        }
         let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range((map_bound(lower), map_bound(upper))),
@@ -89,7 +142,7 @@ impl Transaction {
         );
         if let Some(ref key_hashes) = self.key_hashes {
             let write_set = &mut key_hashes.lock().0;
-            write_set.insert(farmhash::hash32(key));
+            write_set.add_point(Bytes::copy_from_slice(key));
         }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
@@ -102,7 +155,7 @@ impl Transaction {
         );
         if let Some(ref key_hashes) = self.key_hashes {
             let write_set = &mut key_hashes.lock().0;
-            write_set.insert(farmhash::hash32(key));
+            write_set.add_point(Bytes::copy_from_slice(key));
         }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::new());
@@ -139,7 +192,11 @@ impl Transaction {
             let write_set = &mut key_hashes.0;
             let old_data = committed_txns.insert(
                 commit_ts,
-                CommittedTxnData::new(std::mem::take(write_set), self.read_ts, commit_ts),
+                CommittedTxnData::new(
+                    std::mem::take(&mut write_set.point_writes),
+                    self.read_ts,
+                    commit_ts,
+                ),
             );
             debug_assert!(old_data.is_none());
 
@@ -158,19 +215,19 @@ impl Transaction {
 
     fn check_serializable(&self) -> bool {
         let (write_set, read_set) = &*self.key_hashes.as_ref().unwrap().lock();
-        println!("write_set: {:?}, read_set: {:?}", write_set, read_set);
-        println!(
+        log::debug!("write_set: {:?}, read_set: {:?}", write_set, read_set);
+        log::debug!(
             "committed_txns: {:?}",
             self.inner.mvcc().committed_txns.lock()
         );
-        write_set.is_empty()
+        write_set.point_writes.is_empty()
             || self
                 .inner
                 .mvcc()
                 .committed_txns
                 .lock()
                 .range(self.read_ts + 1..)
-                .all(|(_, txn)| read_set.iter().all(|h| !txn.key_hashes.contains(h)))
+                .all(|(_, txn)| txn.keys.iter().all(|key| !read_set.is_key_overlap(key)))
     }
 }
 
@@ -255,7 +312,7 @@ impl TxnIterator {
     fn add_to_read_set(&self, key: &[u8]) {
         if let Some(ref key_hashes) = self.txn.key_hashes {
             let read_set = &mut key_hashes.lock().1;
-            read_set.insert(farmhash::hash32(key));
+            read_set.add_point(Bytes::copy_from_slice(key));
         }
     }
 }
@@ -289,5 +346,45 @@ impl StorageIterator for TxnIterator {
 
     fn num_active_iterators(&self) -> usize {
         self.iter.num_active_iterators()
+    }
+}
+
+#[cfg(test)]
+mod my_tests {
+    use tempfile::tempdir;
+
+    use crate::{
+        compact::CompactionOptions,
+        lsm_storage::{LsmStorageOptions, MiniLsm},
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_serializable_6_scan_serializable() {
+        let get_len = |mut iter: TxnIterator| {
+            let mut len = 0;
+            while iter.is_valid() {
+                len += 1;
+                iter.next().unwrap();
+            }
+            len
+        };
+        let dir = tempdir().unwrap();
+        let mut options =
+            LsmStorageOptions::default_for_week2_test(CompactionOptions::NoCompaction);
+        options.serializable = true;
+        let storage = MiniLsm::open(&dir, options.clone()).unwrap();
+        storage.put(b"key1", b"1").unwrap();
+        storage.put(b"key2", b"2").unwrap();
+        let txn1 = storage.new_txn().unwrap();
+        let txn2 = storage.new_txn().unwrap();
+        let len = get_len(txn1.scan(Bound::Unbounded, Bound::Unbounded).unwrap());
+        txn1.put(b"key_len", format!("{len}").as_bytes());
+        let len = get_len(txn2.scan(Bound::Unbounded, Bound::Unbounded).unwrap());
+        txn2.put(b"key_len", format!("{len}").as_bytes());
+        txn1.commit().unwrap();
+        assert!(txn2.commit().is_err());
+        assert_eq!(storage.get(b"key_len").unwrap(), Some(Bytes::from("2")));
     }
 }

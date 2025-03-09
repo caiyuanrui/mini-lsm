@@ -16,10 +16,11 @@ pub mod txn;
 pub mod watermark;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     sync::{atomic::AtomicBool, Arc},
 };
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::lsm_storage::LsmStorageInner;
@@ -28,7 +29,8 @@ use self::{txn::Transaction, watermark::Watermark};
 
 #[derive(Debug)]
 pub(crate) struct CommittedTxnData {
-    pub(crate) key_hashes: HashSet<u32>,
+    pub(crate) keys: BTreeSet<Bytes>,
+    // pub(crate) key_hashes: HashSet<u32>,
     #[allow(dead_code)]
     pub(crate) read_ts: u64,
     #[allow(dead_code)]
@@ -36,9 +38,15 @@ pub(crate) struct CommittedTxnData {
 }
 
 impl CommittedTxnData {
-    pub(crate) const fn new(key_hashes: HashSet<u32>, read_ts: u64, commit_ts: u64) -> Self {
+    pub(crate) const fn new(
+        keys: BTreeSet<Bytes>,
+        // key_hashes: HashSet<u32>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Self {
         Self {
-            key_hashes,
+            keys,
+            // key_hashes,
             read_ts,
             commit_ts,
         }
