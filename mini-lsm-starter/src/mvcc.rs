@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub mod txn;
 pub mod watermark;
 
@@ -29,12 +26,23 @@ use crate::lsm_storage::LsmStorageInner;
 
 use self::{txn::Transaction, watermark::Watermark};
 
+#[derive(Debug)]
 pub(crate) struct CommittedTxnData {
     pub(crate) key_hashes: HashSet<u32>,
     #[allow(dead_code)]
     pub(crate) read_ts: u64,
     #[allow(dead_code)]
     pub(crate) commit_ts: u64,
+}
+
+impl CommittedTxnData {
+    pub(crate) const fn new(key_hashes: HashSet<u32>, read_ts: u64, commit_ts: u64) -> Self {
+        Self {
+            key_hashes,
+            read_ts,
+            commit_ts,
+        }
+    }
 }
 
 pub(crate) struct LsmMvccInner {
@@ -77,7 +85,11 @@ impl LsmMvccInner {
             inner,
             local_storage: Default::default(),
             committed: Arc::new(AtomicBool::new(false)),
-            key_hashes: None,
+            key_hashes: if serializable {
+                Some(Default::default())
+            } else {
+                None
+            },
         })
     }
 }
