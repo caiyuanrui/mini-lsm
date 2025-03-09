@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{BufWriter, Cursor, Read};
+use std::io::{BufWriter, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 
 use crate::key::{KeyBytes, KeySlice};
 
-// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
+// | batch_size (u32) | key_len (u16) | key | ts (u64) | value_len (u16) | value | ... | checksum (u32) |
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
@@ -49,21 +49,30 @@ impl Wal {
             .with_context(|| format!("failed to open wal file {}", path.as_ref().display()))?;
         let mut buf = Vec::with_capacity(file.metadata()?.len() as usize);
         file.read_to_end(&mut buf)?;
-        let mut cursor = Cursor::new(buf.as_slice());
-        while cursor.has_remaining() {
-            let offset = cursor.position() as usize;
-            let key_len = cursor.get_u16();
-            let key = cursor.copy_to_bytes(key_len as usize);
-            let ts = cursor.get_u64();
-            let value_len = cursor.get_u16();
-            let value = cursor.copy_to_bytes(value_len as usize);
-            let hash = crc32fast::hash(&buf[offset..cursor.position() as usize]);
-            let checksum = cursor.get_u32();
-            if checksum != hash {
-                bail!("wal checksum mismatch")
+
+        let mut buf = buf.as_slice();
+        while buf.has_remaining() {
+            let batch_size = buf.get_u32() as usize;
+            if buf.len() < batch_size + size_of::<u32>() {
+                bail!("incomplete WAL")
             }
-            skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
+            let mut batch = &buf[..batch_size];
+            buf.advance(batch_size);
+            let checksum = buf.get_u32();
+            if crc32fast::hash(batch) != checksum {
+                bail!("checksum mismatched")
+            }
+
+            while batch.has_remaining() {
+                let key_len = batch.get_u16() as usize;
+                let key = batch.copy_to_bytes(key_len);
+                let ts = batch.get_u64();
+                let value_len = batch.get_u16() as usize;
+                let value = batch.copy_to_bytes(value_len);
+                skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
+            }
         }
+
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
         })
@@ -71,22 +80,30 @@ impl Wal {
 
     /// Note that data is persisted only when `sync` is called.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        // | key_len | key | ts (u64) | value_len | value | checksum |
-        let mut buf = BytesMut::with_capacity(key.raw_len() + value.len());
-        buf.put_u16(key.key_len() as u16);
-        buf.put_slice(key.key_ref());
-        buf.put_u64(key.ts());
-        buf.put_u16(value.len() as u16);
-        buf.put_slice(value);
-        buf.put_u32(crc32fast::hash(&buf));
-        let mut file = self.file.lock();
-        file.write_all(&buf.freeze())?;
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        let batch_size: usize = data
+            .iter()
+            .map(|&(k, v)| 2 * size_of::<u16>() + size_of::<u64>() + k.key_len() + v.len())
+            .sum();
+        let total_size = batch_size + size_of::<u32>() * 2;
+        let mut buf = BytesMut::with_capacity(total_size);
+        buf.put_u32(batch_size as u32);
+        for (key, value) in data {
+            buf.put_u16(key.key_len() as u16);
+            buf.put_slice(key.key_ref());
+            buf.put_u64(key.ts());
+            buf.put_u16(value.len() as u16);
+            buf.put_slice(value);
+        }
+        let checksum = crc32fast::hash(&buf[size_of::<u32>()..]);
+        buf.put_u32(checksum);
+        let encoded = buf.freeze();
+        self.file.lock().write_all(&encoded)?;
+        Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {

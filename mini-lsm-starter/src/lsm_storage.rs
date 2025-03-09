@@ -555,8 +555,9 @@ impl LsmStorageInner {
                 .read()
                 .memtable
                 .put(KeySlice::from_slice(key, ts), value)?;
-            self.try_freeze()?;
         }
+        // a batch should be in one mmetable even if it exceeds the size limit
+        self.try_freeze()?;
         self.mvcc().update_commit_ts(ts);
         Ok(())
     }
