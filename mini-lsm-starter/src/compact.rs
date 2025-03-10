@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+// #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
+// #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 mod leveled;
 mod simple_leveled;
@@ -35,7 +35,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -147,11 +147,10 @@ impl LsmStorageInner {
         let mut last_key: Vec<u8> = Vec::new();
         let watermark = self.mvcc().watermark();
         let mut first_key_below_watermark = false;
+        let compaction_filter = self.compaction_filters.lock().clone();
 
-        while iter.is_valid() {
-            let (key, value) = (iter.key(), iter.value());
-
-            let is_first_key = last_key != key.key_ref();
+        'outer: while iter.is_valid() {
+            let is_first_key = last_key != iter.key().key_ref();
             if is_first_key {
                 first_key_below_watermark = true;
             }
@@ -166,18 +165,28 @@ impl LsmStorageInner {
                 builder = SsTableBuilder::new(self.options.block_size);
             }
 
-            if key.ts() > watermark {
+            if iter.key().ts() > watermark {
                 first_key_below_watermark = true;
-                builder.add(key, value);
+                builder.add(iter.key(), iter.value());
                 last_key.clear();
-                last_key.extend(key.key_ref());
+                last_key.extend(iter.key().key_ref());
             } else if first_key_below_watermark {
                 first_key_below_watermark = false;
-                if !value.is_empty() || !compact_to_bottom_level {
-                    builder.add(key, value);
+                for filter in compaction_filter.iter() {
+                    match filter {
+                        CompactionFilter::Prefix(needle) => {
+                            if iter.key().key_ref().starts_with(needle) {
+                                iter.next()?;
+                                continue 'outer;
+                            }
+                        }
+                    }
+                }
+                if !iter.value().is_empty() || !compact_to_bottom_level {
+                    builder.add(iter.key(), iter.value());
                 }
                 last_key.clear();
-                last_key.extend(key.key_ref());
+                last_key.extend(iter.key().key_ref());
             }
 
             iter.next()?;
@@ -223,22 +232,22 @@ impl LsmStorageInner {
             CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
-                lower_level,
+                lower_level: _,
                 lower_level_sst_ids,
-                is_lower_level_bottom_level,
+                ..
             })
             | CompactionTask::Leveled(LeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
-                lower_level,
+                lower_level: _,
                 lower_level_sst_ids,
-                is_lower_level_bottom_level,
+                ..
             }) => {
                 let state = self.state.read();
 
                 match upper_level {
                     // merge >=L1
-                    Some(upper_level) => {
+                    Some(_upper_level) => {
                         let upper_iter = SstConcatIterator::create_and_seek_to_first(
                             upper_level_sst_ids
                                 .iter()
@@ -279,7 +288,7 @@ impl LsmStorageInner {
             }
             CompactionTask::Tiered(TieredCompactionTask {
                 tiers,
-                bottom_tier_included,
+                bottom_tier_included: _,
             }) => {
                 let snapshot = { self.state.read().clone() };
                 let iter = {
